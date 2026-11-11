@@ -273,6 +273,81 @@ extern "C" int ds4_gpu_dsv41_hc_tail(ds4_gpu_tensor *split_out, const ds4_gpu_te
     return cuda_ok(cudaGetLastError(), "V4.1 fused HC tail");
 }
 
+/* One-token decode: the HC mixer of a sublayer (RMS norm of the 4 x 5120
+ * residual, the 20480 -> 24 projection, Sinkhorn) is only consumed by the
+ * expand at the END of that sublayer. Run it on a non-blocking side stream so
+ * it overlaps the sublayer's large kernels instead of sitting in front of
+ * them; the main stream keeps only the weighted sum + norm it needs at once.
+ * Same kernels and arithmetic as the fused tail; events order the two
+ * streams (side waits for the residual, the expand waits for the mixer).
+ * DS4_ROCM_V41_HC_SIDE_STREAM=0 disables. */
+__global__ static void v41_hc_ordered_prefetch_kernel(float *out,
+        const __half *weights, const float *input);
+__global__ static void v41_hc_split_one_kernel(float *split_out, const float *mix,
+        const float *hscale, const float *hbase, uint32_t sinkhorn_iters, float hc_eps) {
+    if (threadIdx.x == 0u) hc4_split_one(split_out, mix, hscale, hbase, sinkhorn_iters, hc_eps);
+}
+static cudaStream_t g_v41_hc_side_stream;
+static cudaEvent_t g_v41_hc_side_ready, g_v41_hc_side_done;
+static int g_v41_hc_side_pending;
+extern "C" int ds4_gpu_dsv41_hc_mix_side_join(void) {
+    if (!g_v41_hc_side_pending) return 1;
+    g_v41_hc_side_pending = 0;
+    return cuda_ok(hipStreamWaitEvent((hipStream_t)0, g_v41_hc_side_done, 0), "V4.1 HC side join");
+}
+/* Returns 1 started, 0 not applicable (caller uses the fused tail), -1 error. */
+extern "C" int ds4_gpu_dsv41_hc_mix_side(ds4_gpu_tensor *split_out, ds4_gpu_tensor *mix,
+        ds4_gpu_tensor *flat_norm, const ds4_gpu_tensor *residual,
+        const void *model_map, uint64_t model_size, uint64_t fn_offset,
+        uint64_t scale_offset, uint64_t base_offset, uint32_t sinkhorn_iters,
+        float hc_eps, float rms_eps) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_HC_SIDE_STREAM");
+        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
+    }
+    const uint64_t fn_bytes = UINT64_C(20480) * 24u * sizeof(uint16_t);
+    if (!on || g_quality_mode || !split_out || !mix || !flat_norm || !residual || !model_map ||
+        !cuda_tensor_has_bytes(mix, 24u * 4u) || !cuda_tensor_has_bytes(split_out, 24u * 4u) ||
+        !cuda_tensor_has_f32(residual, 4u * 5120u) || !cuda_tensor_has_f32(flat_norm, 4u * 5120u) ||
+        !cuda_model_range_fits(model_size, fn_offset, fn_bytes) ||
+        !cuda_model_range_fits(model_size, scale_offset, 3u * 4u) ||
+        !cuda_model_range_fits(model_size, base_offset, 24u * 4u) ||
+        !rms_norm_batched_on() || cuda_runtime_config()->graph_dump) return 0;
+    const __half *w = (const __half *)cuda_model_range_ptr(model_map, fn_offset, fn_bytes, "V4.1 tiny HC F16");
+    const float *hs = (const float *)cuda_model_range_ptr(model_map, scale_offset, 12u, "hc_scale");
+    const float *hb = (const float *)cuda_model_range_ptr(model_map, base_offset, 96u, "hc_base");
+    if (!w || !hs || !hb || ((uintptr_t)w % alignof(__half2)) != 0u ||
+        ((uintptr_t)flat_norm->ptr % alignof(float2)) != 0u) return 0;
+    if (!g_v41_hc_side_stream) {
+        if (hipStreamCreateWithFlags(&g_v41_hc_side_stream, cudaStreamNonBlocking) != hipSuccess ||
+            cudaEventCreateWithFlags(&g_v41_hc_side_ready, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&g_v41_hc_side_done, cudaEventDisableTiming) != cudaSuccess) {
+            (void)cudaGetLastError();
+            g_v41_hc_side_stream = NULL;
+            on = 0;
+            return 0;
+        }
+        fprintf(stderr, "ds4: ROCm V4.1 HC mixer on a side stream\n");
+    }
+    /* A previous mixer nobody joined must not be overtaken. */
+    if (g_v41_hc_side_pending && !ds4_gpu_dsv41_hc_mix_side_join()) return -1;
+    if (!cuda_ok(cudaEventRecord(g_v41_hc_side_ready, 0), "V4.1 HC side dependency record") ||
+        !cuda_ok(hipStreamWaitEvent(g_v41_hc_side_stream, g_v41_hc_side_ready, 0), "V4.1 HC side dependency wait"))
+        return -1;
+    rms_norm_batched_kernel<false><<<1, 256, 0, g_v41_hc_side_stream>>>((float *)flat_norm->ptr,
+        (const float *)residual->ptr, NULL, 4u * 5120u, 1, rms_eps);
+    v41_hc_ordered_prefetch_kernel<<<dim3(24u, 1u), 32u, 0, g_v41_hc_side_stream>>>(
+        (float *)mix->ptr, w, (const float *)flat_norm->ptr);
+    v41_hc_split_one_kernel<<<1, 32, 0, g_v41_hc_side_stream>>>((float *)split_out->ptr,
+        (const float *)mix->ptr, hs, hb, sinkhorn_iters, hc_eps);
+    if (!cuda_ok(cudaGetLastError(), "V4.1 HC side launch") ||
+        !cuda_ok(cudaEventRecord(g_v41_hc_side_done, g_v41_hc_side_stream), "V4.1 HC side done record"))
+        return -1;
+    g_v41_hc_side_pending = 1;
+    return 1;
+}
+
 struct v41_rope_args {
     uint32_t width, heads, start, stride, inverse;
     float frequencies[32];

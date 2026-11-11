@@ -2787,6 +2787,12 @@ void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);
 int ds4_gpu_dspark_gfx1151_fast_path(void);
 void ds4_gpu_set_dspark_verify_mode(bool enabled);
 void ds4_gpu_set_v41_decode_like_batch(bool enabled);
+int ds4_gpu_dsv41_hc_mix_side(ds4_gpu_tensor *split_out, ds4_gpu_tensor *mix,
+        ds4_gpu_tensor *flat_norm, const ds4_gpu_tensor *residual,
+        const void *model_map, uint64_t model_size, uint64_t fn_offset,
+        uint64_t scale_offset, uint64_t base_offset, uint32_t sinkhorn_iters,
+        float hc_eps, float rms_eps);
+int ds4_gpu_dsv41_hc_mix_side_join(void);
 #elif !defined(__APPLE__)
 int ds4_gpu_device_is_spark(void);
 #endif

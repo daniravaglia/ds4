@@ -41094,6 +41094,7 @@ static bool ds41_hc_expand_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *block
                                 const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
                                 ds4_gpu_tensor *copy4) {
 #ifdef DS4_ROCM_BUILD
+    if (!ds4_gpu_dsv41_hc_mix_side_join()) return false;
     if (ds41_norm_fuse_on())
         return ds4_gpu_hc_expand_split_bf16_tensor((ds4_gpu_tensor *)out, block, residual,
             split, DS4_N_EMBD, DS4_N_HC, copy4) != 0;
@@ -41159,6 +41160,19 @@ static bool ds41_hc_mix_norm(ds41_gpu_graph *g, const ds4_model *m,
         const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
         const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
         const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
+        /* The mixer on a side stream (joined before the expand that reads
+         * its split); here only the weighted sum + norm needed right away. */
+        if (fn->type == DS4_TENSOR_F16 && fn->dim[0] == 20480u && fn->dim[1] == 24u &&
+            g->tp_world == 1u && !g->imatrix && !getenv("DS4_V41_TRACE_POS")) {
+            const int side = ds4_gpu_dsv41_hc_mix_side(ffn ? g->ffn_split : g->attn_split,
+                g->mix, g->flat_norm, residual, m->map, m->size, fn->abs_offset,
+                scale->abs_offset, base->abs_offset, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS,
+                DS4_RMS_EPS);
+            if (side < 0) return false;
+            if (side > 0)
+                return ds4_gpu_dsv41_hc_wsum_norm_rows(g->x, g->norm, residual, w, 4u,
+                    m->map, m->size, norm_weight->abs_offset, 1u, DS4_RMS_EPS) != 0;
+        }
         return ds4_gpu_rms_norm_plain_tensor(g->flat_norm, residual,
                    DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS) &&
                ds41_matmul(g->mix, m, fn, g->flat_norm, false) &&
@@ -42408,6 +42422,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
 #ifdef DS4_ROCM_BUILD
+    if (!ds4_gpu_dsv41_hc_mix_side_join()) return false;
     if (ds41_norm_fuse_on() && g->tp_world == 1u)
         return ds4_gpu_hc_expand_split_bf16_tensor(g->residual, g->block, g->after_attn,
             g->ffn_split, DS4_N_EMBD, DS4_N_HC, g->pre) != 0;
