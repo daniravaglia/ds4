@@ -1341,13 +1341,34 @@ static int routed_moe_launch(
             !routed_moe_decode_profile_record_event(
                 DS4_ROCM_MOE_DECODE_PROFILE_XQUANT_END,
                 "IQ2 decode MoE profile split x quant end")) return 0;
+        /* Prompt-lookup verification: the rows use the one-token decode
+         * kernels' arithmetic (quantized activations in, quantized mid into the
+         * down projection), by unique expert. DS4_ROCM_V41_DECODE_LIKE_BATCH=0
+         * keeps the generic small-batch kernels. */
+        static int decode_like_env = -1;
+        if (decode_like_env < 0) {
+            const char *v = getenv("DS4_ROCM_V41_DECODE_LIKE_BATCH");
+            decode_like_env = !(v && v[0] == '0');
+        }
+        const bool decode_like = decode_like_env && g_v41_decode_like_batch && iq2_path &&
+            !use_rocm_mmq_gateup && n_tokens <= 8u && stream_batch_unique != 0u &&
+            n_expert == 6u && (batch_stream_selected || batch_stream_split_selected);
+        const dim3 dl_grid((expert_mid_dim + 3u) / 4u, stream_batch_unique, 1);
         if (ok && (batch_stream_selected || batch_stream_split_selected)) {
             dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
             if (batch_stream_split_selected) {
                 const bool unique_split = n_tokens <= 8u && stream_batch_unique != 0u &&
                     !getenv("DS4_ROCM_DISABLE_MOE_UNIQUE_BATCH");
                 const dim3 ugrid((expert_mid_dim + 127u) / 128u, stream_batch_unique, 1);
-                if (stream_batch_resident_count != 0u && unique_split) {
+                if (stream_batch_resident_count != 0u && decode_like) {
+                    moe_v41_gate_up_wave_unique_ptrs_kernel<4, 8u><<<dl_grid, 128>>>(
+                            (float *)mid->ptr, resident_gate_slot_ptrs, resident_up_slot_ptrs, xq,
+                            (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
+                            gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            (uint32_t)pair_count, clamp, stream_batch_pair_missing, 0u);
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe streaming batch resident decode-like gate/up launch");
+                } else if (stream_batch_resident_count != 0u && unique_split) {
                     moe_gate_up_mid_unique_ptrs_kernel<8u><<<ugrid, 256>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             resident_gate_slot_ptrs, resident_up_slot_ptrs, xq,
@@ -1382,7 +1403,15 @@ static int routed_moe_launch(
                 } else {
                     ok = cuda_stream_batch_selected_finish_pending_missing();
                 }
-                if (ok && stream_batch_missing_count != 0u && unique_split) {
+                if (ok && stream_batch_missing_count != 0u && decode_like) {
+                    moe_v41_gate_up_wave_unique_ptrs_kernel<4, 8u><<<dl_grid, 128>>>(
+                            (float *)mid->ptr, missing_gate_slot_ptrs, missing_up_slot_ptrs, xq,
+                            (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
+                            gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            (uint32_t)pair_count, clamp, stream_batch_pair_missing, 1u);
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe streaming batch missing decode-like gate/up launch");
+                } else if (ok && stream_batch_missing_count != 0u && unique_split) {
                     moe_gate_up_mid_unique_ptrs_kernel<8u><<<ugrid, 256>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             missing_gate_slot_ptrs, missing_up_slot_ptrs, xq,
@@ -1412,6 +1441,14 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(),
                                  "routed_moe streaming batch missing gate/up launch");
                 }
+            } else if (decode_like) {
+                moe_v41_gate_up_wave_unique_ptrs_kernel<4, 8u><<<dl_grid, 128>>>(
+                        (float *)mid->ptr, gate_slot_ptrs, up_slot_ptrs, xq,
+                        (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
+                        gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        (uint32_t)pair_count, clamp, NULL, 0u);
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe streaming batch decode-like gate/up launch");
             } else if (n_tokens <= 8u && stream_batch_unique != 0u &&
                        !getenv("DS4_ROCM_DISABLE_MOE_UNIQUE_BATCH")) {
                 /* Small batches (DSpark verify): read each unique expert once. */
@@ -1443,7 +1480,7 @@ static int routed_moe_launch(
                 ok = cuda_ok(cudaGetLastError(),
                              "routed_moe streaming batch gate/up launch");
             }
-            if (ok && !iq2_path) {
+            if (ok && (!iq2_path || decode_like)) {
                 dim3 midq_grid(midq_blocks, pair_count, 1);
                 q8_K_quantize_kernel<<<midq_grid, 256>>>(
                         midq,
@@ -1467,6 +1504,14 @@ static int routed_moe_launch(
                             n_tokens);
                     ok = cuda_ok(cudaGetLastError(),
                                  "routed_moe streaming batch iq2 down launch");
+                } else if (decode_like) {
+                    moe_v41_down_wave_ptrs_batch_kernel<4><<<
+                            dim3((out_dim + 3u) / 4u, n_tokens, 1), 128>>>(
+                        (float *)out->ptr, down_slot_ptrs, midq,
+                        (const int32_t *)selected_exec->ptr,
+                        down_row_bytes, midq_blocks, out_dim, n_expert);
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe streaming batch decode-like down launch");
                 } else if (iq2_path) {
                     const ds4_rocm_runtime_config *runtime_cfg =
                         cuda_runtime_config();

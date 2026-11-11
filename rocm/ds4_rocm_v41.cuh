@@ -1593,11 +1593,17 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
     return 1;
 }
 
+static const uint16_t *v41_router_bf16_weights(const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t width, uint32_t outputs);
 /* Keep the scalar 256-lane reduction tree. Reuse weights across tiny rows
  * and replace its final five block barriers with the same warp additions. */
-template <uint32_t TOKENS>
-__global__ static void v41_router_f32_rows_kernel(float *out, const float *weights,
+template <uint32_t TOKENS, bool BF16W = false>
+__global__ static void v41_router_f32_rows_kernel(float *out, const void *weights_any,
         const float *input, uint32_t outputs, uint32_t rows) {
+    /* BF16W: the weights are the exact BF16 copy of the F32 matrix (half the
+     * bytes to read); widening them back gives the same floats. */
+    const float *weights = (const float *)weights_any;
+    const uint16_t *weights16 = (const uint16_t *)weights_any;
     constexpr uint32_t width = 5120u;
     const uint32_t lane = threadIdx.x, row = blockIdx.x;
     float sum[TOKENS] = {};
@@ -1606,7 +1612,9 @@ __global__ static void v41_router_f32_rows_kernel(float *out, const float *weigh
 #pragma unroll
         for (uint32_t u = 0; u < 4u; u++) {
             const uint32_t col = lane + (base + u) * 256u;
-            w[u] = weights[(uint64_t)row * width + col];
+            w[u] = BF16W ?
+                __uint_as_float((uint32_t)weights16[(uint64_t)row * width + col] << 16) :
+                weights[(uint64_t)row * width + col];
 #pragma unroll
             for (uint32_t t = 0; t < TOKENS; t++)
                 x[t][u] = t < rows ? input[(uint64_t)t * width + col] : 0.0f;
@@ -1653,6 +1661,27 @@ extern "C" int ds4_gpu_dsv41_f32_projection_rows(ds4_gpu_tensor *out,
     const float *w = (const float *)cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "V4.1 tiny F32 projection");
     if (!w) return 0;
+    if (ds4_rocm_is_gfx1151() && width == 5120u && outputs == 384u && !g_quality_mode) {
+        /* Router: read the exact BF16 copy of the weights (bit-identical
+         * results, half the bytes). DS4_ROCM_V41_ROUTER_BF16_DECODE=0 restores. */
+        static int bf16_on = -1;
+        if (bf16_on < 0) {
+            const char *v = getenv("DS4_ROCM_V41_ROUTER_BF16_DECODE");
+            bf16_on = !(v && v[0] == '0');
+        }
+        const uint16_t *w16 = bf16_on ?
+            v41_router_bf16_weights(model_map, model_size, weight_offset, width, outputs) : NULL;
+        if (w16) {
+#define V41_ROUTER_ROWS16(T) v41_router_f32_rows_kernel<T, true><<<outputs, 256u>>>( \
+        (float *)out->ptr, w16, (const float *)in->ptr, outputs, rows)
+            if (rows == 1u) { V41_ROUTER_ROWS16(1u); }
+            else if (rows == 2u) { V41_ROUTER_ROWS16(2u); }
+            else if (rows == 3u) { V41_ROUTER_ROWS16(3u); }
+            else { V41_ROUTER_ROWS16(6u); }
+#undef V41_ROUTER_ROWS16
+            return cuda_ok(cudaGetLastError(), "V4.1 tiny BF16 router projection");
+        }
+    }
     if (ds4_rocm_is_gfx1151() && width == 5120u &&
         (outputs == 128u || outputs == 384u)) {
 #define V41_ROUTER_ROWS(T) v41_router_f32_rows_kernel<T><<<outputs, 256u>>>( \
@@ -2062,20 +2091,12 @@ __global__ static void v41_f32_to_bf16_exact_kernel(uint16_t *out, const float *
     out[i] = (uint16_t)(bits >> 16);
     if (bits & 0xffffu) atomicOr(inexact, 1u);
 }
-extern "C" int ds4_gpu_dsv41_router_bf16_rows(ds4_gpu_tensor *out, const void *model_map,
-        uint64_t model_size, uint64_t weight_offset, uint32_t width, uint32_t outputs,
-        uint32_t rows, const ds4_gpu_tensor *in) {
-    static int on = -1;
-    if (on < 0) {
-        const char *v = getenv("DS4_ROCM_V41_ROUTER_BF16");
-        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
-    }
-    if (!on || g_quality_mode || rows < 16u || rows > 2048u || outputs != 384u || width != 5120u ||
-        !model_map || !cuda_tensor_has_elems2(in, width, rows, 4u) ||
-        !cuda_tensor_has_elems2(out, outputs, rows, 4u) ||
-        ((uintptr_t)in->ptr % 16u) != 0u) return 0;
+/* Exact BF16 copy of a router matrix (made once per layer and kept), or NULL
+ * when the matrix is not BF16 values. */
+static const uint16_t *v41_router_bf16_weights(const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t width, uint32_t outputs) {
     const uint64_t n = (uint64_t)outputs * width;
-    if (!cuda_model_range_fits(model_size, weight_offset, n * sizeof(float))) return 0;
+    if (!cuda_model_range_fits(model_size, weight_offset, n * sizeof(float))) return NULL;
     struct entry { const void *map; uint64_t offset; uint16_t *w; int state; };
     static entry cache[64];
     entry *e = NULL;
@@ -2084,15 +2105,15 @@ extern "C" int ds4_gpu_dsv41_router_bf16_rows(ds4_gpu_tensor *out, const void *m
         if (!cache[i].state) {
             const float *w32 = (const float *)cuda_model_range_ptr(model_map, weight_offset,
                 n * sizeof(float), "V4.1 router F32");
-            if (!w32) return 0;
+            if (!w32) return NULL;
             uint16_t *w16 = NULL; uint32_t *flag = NULL;
             if (!cuda_ok(cudaMalloc(&w16, n * sizeof(uint16_t)), "V4.1 router BF16 weights") ||
-                !cuda_ok(cudaMalloc(&flag, sizeof(uint32_t)), "V4.1 router BF16 check")) return 0;
+                !cuda_ok(cudaMalloc(&flag, sizeof(uint32_t)), "V4.1 router BF16 check")) return NULL;
             uint32_t inexact = 0;
-            if (!cuda_ok(cudaMemcpy(flag, &inexact, sizeof(inexact), cudaMemcpyHostToDevice), "V4.1 router BF16 check reset")) return 0;
+            if (!cuda_ok(cudaMemcpy(flag, &inexact, sizeof(inexact), cudaMemcpyHostToDevice), "V4.1 router BF16 check reset")) return NULL;
             v41_f32_to_bf16_exact_kernel<<<(unsigned)((n + 255u) / 256u), 256u>>>(w16, w32, n, flag);
             if (!cuda_ok(cudaGetLastError(), "V4.1 router BF16 convert") ||
-                !cuda_ok(cudaMemcpy(&inexact, flag, sizeof(inexact), cudaMemcpyDeviceToHost), "V4.1 router BF16 check read")) return 0;
+                !cuda_ok(cudaMemcpy(&inexact, flag, sizeof(inexact), cudaMemcpyDeviceToHost), "V4.1 router BF16 check read")) return NULL;
             (void)cudaFree(flag);
             cache[i].map = model_map; cache[i].offset = weight_offset;
             if (inexact) {
@@ -2108,8 +2129,23 @@ extern "C" int ds4_gpu_dsv41_router_bf16_rows(ds4_gpu_tensor *out, const void *m
             break;
         }
     }
-    if (!e || e->state != 1 || ((uintptr_t)e->w % 16u) != 0u) return 0;
-    if (ds41_v41_matmul_bf16(e->w, (const float *)in->ptr, (float *)out->ptr, outputs, width, rows)) return 0;
+    return e && e->state == 1 ? e->w : NULL;
+}
+extern "C" int ds4_gpu_dsv41_router_bf16_rows(ds4_gpu_tensor *out, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t width, uint32_t outputs,
+        uint32_t rows, const ds4_gpu_tensor *in) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_ROUTER_BF16");
+        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
+    }
+    if (!on || g_quality_mode || rows < 16u || rows > 2048u || outputs != 384u || width != 5120u ||
+        !model_map || !cuda_tensor_has_elems2(in, width, rows, 4u) ||
+        !cuda_tensor_has_elems2(out, outputs, rows, 4u) ||
+        ((uintptr_t)in->ptr % 16u) != 0u) return 0;
+    const uint16_t *w16 = v41_router_bf16_weights(model_map, model_size, weight_offset, width, outputs);
+    if (!w16 || ((uintptr_t)w16 % 16u) != 0u) return 0;
+    if (ds41_v41_matmul_bf16(w16, (const float *)in->ptr, (float *)out->ptr, outputs, width, rows)) return 0;
     static int logged = 0;
     if (!logged) { logged = 1; fprintf(stderr, "ds4: ROCm V4.1 router on BF16 matrix cores active (rows=%u)\n", rows); }
     return 1;

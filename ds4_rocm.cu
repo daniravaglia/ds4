@@ -48,6 +48,13 @@ extern "C" void ds4_gpu_set_dspark_verify_mode(bool enabled) {
     g_dspark_verify_mode = enabled;
 }
 
+/* V4.1 small batches whose routed experts use the one-token decode
+ * arithmetic (prompt-lookup verification). */
+static thread_local bool g_v41_decode_like_batch;
+extern "C" void ds4_gpu_set_v41_decode_like_batch(bool enabled) {
+    g_v41_decode_like_batch = enabled;
+}
+
 extern "C" int ds4_mmq_init(int device);
 extern "C" int ds4_mmq_iq2_xxs_moe_pair(
     const void *W_a, const void *W_b, const float *X_f32,

@@ -2786,6 +2786,7 @@ void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);
 #ifdef DS4_ROCM_BUILD
 int ds4_gpu_dspark_gfx1151_fast_path(void);
 void ds4_gpu_set_dspark_verify_mode(bool enabled);
+void ds4_gpu_set_v41_decode_like_batch(bool enabled);
 #elif !defined(__APPLE__)
 int ds4_gpu_device_is_spark(void);
 #endif

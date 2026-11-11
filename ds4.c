@@ -40405,6 +40405,10 @@ typedef struct {
     uint32_t targets[DS4_DSPARK_MAX_TARGET_LAYERS];
     uint32_t mh_pos0, mh_rows, verify_rows;
     uint32_t skip_left, policy_cycles, policy_drafted, policy_accepted;
+    /* Prompt lookup: where in the history the copy being followed continues,
+     * and how many single-token steps have passed without a draft. */
+    uint32_t lk_cursor, lk_idle;
+    bool lk_valid;
     ds4_gpu_tensor *mh, *pending, *ring, *raw, *conf_proj, *markov_head_t;
     ds4_gpu_tensor *tokens, *conf, *parts, *logits, *x, *xn;
     ds4_gpu_tensor *saved, *pool_kv, *pool_score;
@@ -40436,6 +40440,9 @@ static void ds41_draft_reset(ds41_draft *d) {
     d->policy_cycles = 0;
     d->policy_drafted = 0;
     d->policy_accepted = 0;
+    d->lk_cursor = 0;
+    d->lk_idle = 0;
+    d->lk_valid = false;
 }
 
 typedef struct {
@@ -40470,6 +40477,9 @@ typedef struct {
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
     ds41_draft *draft;
+    /* Prompt-lookup verification state (no drafter). Installed as `draft`
+     * only for the duration of one verify + rollback. */
+    ds41_draft *lookup;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -40530,6 +40540,7 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
 #endif
     ds4_gpu_tensor_free(g->prefill_tokens);
     ds41_draft_free(g->draft);
+    ds41_draft_free(g->lookup);
     memset(g, 0, sizeof(*g));
     g->table[0].fd = g->table[1].fd = -1;
 }
@@ -40635,6 +40646,7 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->valid = true;
     ds4_engram_history_reset(&g->history);
     ds41_draft_reset(g->draft);
+    ds41_draft_reset(g->lookup);
     /* Valid lengths, not zeroed storage, determine cache visibility. Each
      * partial pair is overwritten by its even-position token before use. */
 }
@@ -41735,6 +41747,30 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
         ok = ds41_moe_finish(g, il);
         if (profile) ok = ds41_decode_stage_profile_mark("moe_finish", il, start, ok);
     }
+    /* Diagnostic: DS4_V41_ROUTE_DUMP=1 prints the 16 best router scores of
+     * each decoded layer (drains the GPU; for offline prefetch studies). */
+    static int route_dump = -1;
+    if (route_dump < 0) route_dump = getenv("DS4_V41_ROUTE_DUMP") != NULL;
+    if (ok && route_dump) {
+        float probs[DS4_N_EXPERT];
+        const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
+        ok = ds4_gpu_synchronize() && ds4_gpu_tensor_read(g->route_probs, 0, probs, sizeof(probs));
+        if (ok) {
+            const float *b = (const float *)((const uint8_t *)m->map + bias->abs_offset);
+            bool used[DS4_N_EXPERT]; memset(used, 0, sizeof(used));
+            fprintf(stderr, "ds4: RD %u %u", g->pos, il);
+            for (int k = 0; k < 16; k++) {
+                int best = -1; float bs = -1e30f;
+                for (int e = 0; e < DS4_N_EXPERT; e++) {
+                    const float sc = probs[e] + b[e];
+                    if (!used[e] && sc > bs) { bs = sc; best = e; }
+                }
+                used[best] = true;
+                fprintf(stderr, " %d:%.4f", best, bs);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     return ok;
 }
 
@@ -42706,7 +42742,7 @@ static bool ds41_draft_pending(ds41_gpu_graph *g) {
     ds41_draft *d = g->draft;
     const ds4_dspark_weights *dw = d->w;
     const uint32_t n = d->mh_rows, dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM;
-    if (!n) return true;
+    if (!n || !dw) return true;   /* lookup-only state has no drafter features */
     ds4_gpu_tensor *mh = ds4_gpu_tensor_view(d->mh, 0,
         (uint64_t)n * d->n_target * dim * sizeof(float));
     ds4_gpu_tensor *mx = ds4_gpu_tensor_view(d->rows_x, 0,
@@ -43147,6 +43183,44 @@ static bool ds41_draft_init(ds41_gpu_graph *g,
     g->draft = d;
     g->allocation_bytes = ds4_add_sat_u64(g->allocation_bytes,
                                            ds41_draft_bytes(dw));
+    return true;
+}
+
+/* Verification state for prompt-lookup drafting: the buffers a multi-row
+ * verify and its rollback need, without any drafter. Rows are capped at six
+ * (the tiny-batch kernels). */
+#define DS41_LOOKUP_BLOCK 5u
+static bool ds41_lookup_enabled(void) {
+#ifdef DS4_ROCM_BUILD
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_V41_LOOKUP");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+#else
+    return false;
+#endif
+}
+static bool ds41_lookup_init(ds41_gpu_graph *g) {
+    if (g->lookup || g->draft || DS4_N_HC > 8u) return g->lookup != NULL;
+    ds41_draft *d = xcalloc(1, sizeof(*d));
+    d->block = DS41_LOOKUP_BLOCK;
+    const uint64_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM, B = d->block;
+    if (!(d->xn = ds4_gpu_tensor_alloc((B + 1u) * dim * sizeof(float))) ||
+        !(d->saved = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER *
+            (DS4_DSPARK_MAX_BLOCK_SIZE + 1u) * hd * sizeof(float))) ||
+        !(d->pool_kv = ds4_gpu_tensor_alloc(4u *
+            (DS4_DSPARK_MAX_BLOCK_SIZE + 1u) * hd * sizeof(float))) ||
+        !(d->pool_score = ds4_gpu_tensor_alloc(4u *
+            (DS4_DSPARK_MAX_BLOCK_SIZE + 1u) * hd * sizeof(float))) ||
+        !(d->rows_logits = ds4_gpu_tensor_alloc_managed((B + 1u) *
+            DS4_N_VOCAB * sizeof(float))) ||
+        !(d->rows_x = ds4_gpu_tensor_alloc((B + 1u) * dim * sizeof(float)))) {
+        ds41_draft_free(d);
+        return false;
+    }
+    g->lookup = d;
     return true;
 }
 
@@ -45613,6 +45687,7 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
      * routed-MoE shapes used by V4.1; the model-specific dimensions remain
      * checked at each backend dispatch. */
     ds4_gpu_set_dspark_verify_mode(true);
+    ds4_gpu_set_v41_decode_like_batch(!d->w);
     const char *dense_env = getenv("DS4_ROCM_DSPARK_V41_GENERIC_DENSE");
     g_ds41_dspark_verify_dense = dense_env && dense_env[0] != '0';
 #endif
@@ -45644,6 +45719,7 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
 #ifdef DS4_ROCM_BUILD
     g_ds41_dspark_verify_dense = false;
     ds4_gpu_set_dspark_verify_mode(false);
+    ds4_gpu_set_v41_decode_like_batch(false);
 #endif
     d->verify_rows = 0;
     if (!ok) {
@@ -63912,6 +63988,7 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    bool lookup_allowed;   /* caller permits prompt-lookup drafts for the next eval */
     bool greedy_splitkv_anchor_valid;
 };
 
@@ -65814,6 +65891,21 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
 
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
     return s ? &s->checkpoint : NULL;
+}
+
+/* Prompt-lookup drafting (DeepSeek V4.1, ROCm): available when the session
+ * has its verification buffers; the caller allows it per eval, and must not
+ * when it could need to rewind inside the returned block. */
+bool ds4_session_lookup_available(ds4_session *s) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    return s && ds4_session_is_ds41(s) && s->ds41_graph.lookup != NULL;
+#else
+    (void)s;
+    return false;
+#endif
+}
+void ds4_session_set_lookup(ds4_session *s, bool allowed) {
+    if (s) s->lookup_allowed = allowed;
 }
 
 #ifndef DS4_NO_GPU
@@ -76920,6 +77012,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s);
             return 1;
         }
+        /* Prompt-lookup drafting needs no support model. Single-GPU ROCm only;
+         * a failed allocation just leaves it off. */
+        if (!e->ds41_dspark && !e->tp.active && !e->quality && ds41_lookup_enabled() &&
+            e->backend != DS4_BACKEND_CPU)
+            (void)ds41_lookup_init(&s->ds41_graph);
         if (e->tp.active) {
             s->ds41_graph.tp_world = 2;
             s->ds41_graph.tp_rank = (uint32_t)e->tp.rank;
@@ -88526,6 +88623,72 @@ static bool ds41_draft_should_propose(bool draftable, bool cost_scheduled,
     return !skip_left || adaptive_off;
 }
 
+static bool ds41_lookup_control_token(const ds4_engine *e, int token) {
+    const ds4_vocab *v = &e->vocab;
+    const int ids[] = {
+        v->bos_id, v->eos_id, v->system_id, v->user_id, v->assistant_id,
+        v->observation_id, v->sop_id, v->think_start_id, v->think_end_id,
+        v->tool_call_start_id, v->tool_call_end_id, v->tool_response_start_id,
+        v->tool_response_end_id, v->arg_key_start_id, v->arg_key_end_id,
+        v->arg_value_start_id, v->arg_value_end_id, v->dsml_id, v->im_start_id,
+        v->im_end_id, v->endoftext_id,
+    };
+    for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++)
+        if (ids[i] >= 0 && token == ids[i]) return true;
+    return false;
+}
+
+/* Prompt-lookup drafting: when the text being generated repeats text already
+ * in the context (file edits, tool-call arguments, quotes), the tokens that
+ * followed the previous occurrence are a free draft. Finds the most recent
+ * earlier position whose preceding min_match tokens equal the current tail
+ * (history + seed) and returns up to max_k tokens that followed it. */
+static uint32_t ds41_lookup_draft(const int *hist, uint32_t len, int seed,
+                                  int *drafts, uint32_t max_k, uint32_t min_match,
+                                  bool near_valid, uint32_t near,
+                                  uint32_t *src, uint32_t *match) {
+    if (!hist || len < 2u || !max_k || min_match < 1u) return 0;
+    uint32_t best_len = 0, best_at = 0;
+    /* A copy that was being followed and broke off (an edited identifier, an
+     * escaped character) usually resumes right there: near the cursor two
+     * matching tokens are enough, and the closest candidate wins. */
+    if (near_valid && near < len) {
+        const uint32_t lo = near > 12u ? near - 12u : 0u;
+        const uint32_t hi = near + 32u < len - 1u ? near + 32u : len - 1u;
+        uint32_t best_dist = UINT32_MAX;
+        for (uint32_t j = lo; j < hi; j++) {
+            if (hist[j] != seed || j < 1u || hist[j - 1u] != hist[len - 1u]) continue;
+            const uint32_t dist = j + 1u > near ? j + 1u - near : near - (j + 1u);
+            if (dist < best_dist) { best_dist = dist; best_at = j; best_len = 2u; }
+        }
+        if (best_len) {
+            uint32_t m = 2u;
+            while (m < 64u && best_at >= m && len > m && hist[best_at - m] == hist[len - m]) m++;
+            best_len = m;
+        }
+    }
+    if (!best_len && len >= min_match + 1u) {
+        /* Anywhere: the most recent earlier occurrence of the seed with the
+         * longest matching tail (history + seed). */
+        for (uint32_t j = len - 1u; j-- > 0;) {
+            if (hist[j] != seed) continue;
+            uint32_t m = 1;
+            while (m < 64u && j >= m && hist[j - m] == hist[len - m]) m++;
+            if (m > best_len) {
+                best_len = m; best_at = j;
+                if (m >= 64u) break;
+            }
+        }
+        if (best_len < min_match) return 0;
+    }
+    if (!best_len) return 0;
+    uint32_t k = 0;
+    while (k < max_k && best_at + 1u + k < len) { drafts[k] = hist[best_at + 1u + k]; k++; }
+    if (src) *src = best_at + 1u;
+    if (match) *match = best_len;
+    return k;
+}
+
 /* Draft from the last committed target features, verify the seed and draft
  * suffix together, then retain only the target-accepted prefix. */
 static int ds41_session_spec(ds4_session *s, int first_token,
@@ -88536,7 +88699,10 @@ static int ds41_session_spec(ds4_session *s, int first_token,
                              char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     ds41_gpu_graph *g = &s->ds41_graph;
-    ds41_draft *d = g->draft;
+    /* Without a drafter the proposals come from prompt lookup only, and the
+     * verification state is installed as g->draft just around the verify. */
+    const bool lookup_only = !g->draft;
+    ds41_draft *d = lookup_only ? g->lookup : g->draft;
     const uint32_t B = d->block, vocab = DS4_N_VOCAB;
     const uint32_t pos = (uint32_t)s->checkpoint.len;
     const bool exact = rng && temperature > 0.0f;
@@ -88549,7 +88715,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
     double propose_seconds = 0.0;
     const bool cost_scheduled = !e->dspark_confidence_threshold_set &&
         ds4_session_dspark_rocm_gfx1151_fast_path(s);
-    const bool draftable = pos >= 1u && d->mh_rows &&
+    const bool draftable = !lookup_only && pos >= 1u && d->mh_rows &&
         pos - 1u >= d->mh_pos0 && pos - 1u < d->mh_pos0 + d->mh_rows &&
         pos + B < g->ctx && max_tokens > 1 && accepted_cap > 1;
     /* The cost scheduler already returns width zero when drafting loses
@@ -88557,10 +88723,34 @@ static int ds41_session_spec(ds4_session *s, int first_token,
      * the next 64 independent decisions; that coarse backoff is retained only
      * for the explicit fixed-threshold policy. */
     /* Honor measured-region backoff before entering the proposal graph. */
-    const bool proposed = ds41_draft_should_propose(
+    /* Prompt lookup. With a drafter loaded it is opt-in (DS4_V41_LOOKUP_MIN=N
+     * replaces the drafter's proposals); without one it is the only proposer.
+     * N is the minimum number of matching tokens (default 4);
+     * DS4_V41_LOOKUP_K caps the draft width. */
+    static int lookup_env = -1, lookup_k = 0;
+    if (lookup_env < 0) {
+        const char *v = getenv("DS4_V41_LOOKUP_MIN");
+        lookup_env = v && v[0] ? atoi(v) : 0;
+        const char *kv = getenv("DS4_V41_LOOKUP_K");
+        lookup_k = kv && kv[0] ? atoi(kv) : (int)DS4_DSPARK_MAX_BLOCK_SIZE;
+        if (lookup_k < 1) lookup_k = 1;
+    }
+    const int lookup_min = lookup_only ? (lookup_env > 0 ? lookup_env : 4) : lookup_env;
+    uint32_t lookup_n = 0, lookup_src = 0, lookup_match = 0;
+    if (lookup_min > 0 && (!lookup_only || (s->lookup_allowed && !d->skip_left)) &&
+        !tp_verify && !g->image_count && pos + B < g->ctx && max_tokens > 1 && accepted_cap > 1)
+        lookup_n = ds41_lookup_draft(s->checkpoint.v, pos, first_token, drafts,
+            (uint32_t)lookup_k < B ? (uint32_t)lookup_k : B, (uint32_t)lookup_min,
+            d->lk_valid, d->lk_cursor, &lookup_src, &lookup_match);
+    /* A short match is a guess: verify three tokens first (a three-row batch
+     * pays for itself with one accepted token). */
+    if (lookup_n > 2u && lookup_match < 4u) lookup_n = 2u;
+    if (lookup_only && d->skip_left) d->skip_left--;
+    if (!lookup_n && d->lk_valid && ++d->lk_idle > 24u) d->lk_valid = false;
+    const bool proposed = lookup_min > 0 ? false : ds41_draft_should_propose(
         draftable, cost_scheduled, tp_verify, d->skip_left,
         ds41_draft_adapt_off());
-    if (draftable && !proposed) {
+    if (draftable && !proposed && lookup_min <= 0) {
         d->skip_left--;
         if (stats) s->dspark_stats.scheduler_skips++;
     }
@@ -88587,6 +88777,23 @@ static int ds41_session_spec(ds4_session *s, int first_token,
             if (!ignore_eos && drafts[i] == eos_token) { k = i; break; }
             if (ignore_eos && ds4_token_is_stop_for_think_mode(
                     e, drafts[i], think_mode)) { k = i; break; }
+        }
+    }
+    if (lookup_n) {
+        k = lookup_n;
+        if (k > (uint32_t)max_tokens - 1u) k = (uint32_t)max_tokens - 1u;
+        if (k > (uint32_t)accepted_cap - 1u) k = (uint32_t)accepted_cap - 1u;
+        if (k > g->ctx - pos - 1u - exact) k = g->ctx - pos - 1u - exact;
+        for (uint32_t i = 0; i < k; i++) {
+            confidence[i] = 0.0f;
+            if (drafts[i] < 0 || drafts[i] >= (int)vocab) { k = i; break; }
+            if (!ignore_eos && drafts[i] == eos_token) { k = i; break; }
+            if (ignore_eos && ds4_token_is_stop_for_think_mode(
+                    e, drafts[i], think_mode)) { k = i; break; }
+            /* Never draft a control token or past one: the caller's parser
+             * state (tool calls, thinking, sampling mode) changes there and a
+             * V4.1 session cannot rewind cheaply. */
+            if (lookup_only && ds41_lookup_control_token(e, drafts[i])) { k = i; break; }
         }
     }
     if (stats) {
@@ -88630,6 +88837,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         return -1;
     }
     const double tv = stats ? now_sec() : 0.0;
+    if (lookup_only) g->draft = d;
     bool ok = ds41_draft_verify(g, &e->model, &e->weights,
                                 tokens, n, rows);
     if (tp_verify && e->tp.vocab_split) {
@@ -88652,6 +88860,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
             (void)ds4_tp_send_verify_commit(e->tp.ctx,
                 DS4_TP_VERIFY_ROLLBACK_REPLAY, 0);
         free(rows);
+        if (lookup_only) g->draft = NULL;
         s->checkpoint_valid = false;
         payload_set_err(err, errlen, "DeepSeek V4.1 verify failed");
         return -1;
@@ -88683,6 +88892,29 @@ static int ds41_session_spec(ds4_session *s, int first_token,
     }
     s->mtp_draft_valid = false;
     ok = ds41_draft_rollback(g, tokens, n, matched + 1u, history);
+    if (lookup_n) {
+        /* Follow the copy: it continues after the accepted tokens, or after
+         * the one token the model changed. */
+        d->lk_cursor = lookup_src + matched + (matched < k ? 1u : 0u);
+        d->lk_valid = true;
+        d->lk_idle = 0;
+    }
+    if (lookup_only) {
+        g->draft = NULL;
+        /* A five-token draft pays for itself from two accepted tokens. After
+         * eight cycles averaging less, stop looking for a while. */
+        d->policy_cycles++;
+        d->policy_accepted += matched;
+        d->policy_drafted += k;
+        if (d->policy_cycles >= 8u) {
+            /* Two of five, or one of two, is break-even. */
+            if (5u * d->policy_accepted < 2u * d->policy_drafted) {
+                d->skip_left = 32u;
+                d->lk_valid = false;
+            }
+            d->policy_cycles = d->policy_accepted = d->policy_drafted = 0;
+        }
+    }
     if (tp_verify) {
         const int32_t mode = ok && matched + 1u == n ?
             DS4_TP_VERIFY_COMMIT_FULL :
@@ -88757,7 +88989,7 @@ static int ds4_session_eval_speculative_argmax_impl(
         return 1;
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s) && s->ds41_graph.draft) {
+    if (ds4_session_is_ds41(s) && (s->ds41_graph.draft || s->ds41_graph.lookup)) {
         if (!accepted || accepted_cap <= 0) return 0;
         return ds41_session_spec(s, first_token, max_tokens, eos_token,
             ignore_eos, think_mode, 0.0f, 0, 0.0f, 0.0f, NULL,
@@ -89633,7 +89865,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
             accepted, accepted_cap, err, errlen);
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s) && s->ds41_graph.draft) {
+    if (ds4_session_is_ds41(s) && (s->ds41_graph.draft || s->ds41_graph.lookup)) {
         return ds41_session_spec(s, first_token, max_tokens, eos_token,
             false, DS4_THINK_HIGH, temperature, top_k, top_p, min_p, rng,
             accepted, accepted_cap, err, errlen);

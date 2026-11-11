@@ -5303,6 +5303,13 @@ static int cuda_stream_selected_load(
                                             down_offset,
                                             gate_expert_bytes,
                                             down_expert_bytes);
+        {
+            /* Diagnostic: DS4_ROCM_STREAM_MISS_LOG=1 prints each selected miss. */
+            static int miss_log = -1;
+            if (miss_log < 0) miss_log = getenv("DS4_ROCM_STREAM_MISS_LOG") != NULL;
+            if (miss_log && idx < 0)
+                fprintf(stderr, "ds4: MISS %u %d\n", layer, selected_ids[i]);
+        }
         if (stats_on) {
             if (idx >= 0) {
                 g_stream_cache_stats.selected_hits++;
