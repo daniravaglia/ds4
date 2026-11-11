@@ -41754,6 +41754,30 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
         ok = ds41_moe_finish(g, il);
         if (profile) ok = ds41_decode_stage_profile_mark("moe_finish", il, start, ok);
     }
+    /* Diagnostic: DS4_V41_ROUTE_PREDICT_DUMP=1 also routes the NEXT layer on
+     * this layer's FFN input (one layer stale) and prints its six picks, to
+     * measure how well a one-layer-ahead prefetch would predict. */
+    static int predict_dump = -1;
+    if (predict_dump < 0) predict_dump = getenv("DS4_V41_ROUTE_PREDICT_DUMP") != NULL;
+    if (ok && predict_dump && il + 1u < DS4_N_LAYER) {
+        static ds4_gpu_tensor *pl, *pp, *ps, *pw;
+        if (!pl) {
+            pl = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
+            pp = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
+            ps = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int32_t));
+            pw = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
+        }
+        const ds4_layer_weights *nl = l + 1;
+        const ds4_tensor *nb = ds41_image_at(g, g->pos) ? nl->ffn_exp_probs_vl : nl->ffn_exp_probs_b;
+        int32_t ids[6];
+        ok = pl && pp && ps && pw && nb &&
+            ds41_matmul(pl, m, nl->ffn_gate_inp, g->norm, false) &&
+            ds4_gpu_router_select_tensor(ps, pw, pp, m->map, m->size, nb->abs_offset, 0, 0, token,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false, pl) &&
+            ds4_gpu_synchronize() && ds4_gpu_tensor_read(ps, 0, ids, sizeof(ids));
+        if (ok) fprintf(stderr, "ds4: PD %u %u %d %d %d %d %d %d\n", g->pos, il + 1u,
+                        ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
+    }
     /* Diagnostic: DS4_V41_ROUTE_DUMP=1 prints the 16 best router scores of
      * each decoded layer (drains the GPU; for offline prefetch studies). */
     static int route_dump = -1;
