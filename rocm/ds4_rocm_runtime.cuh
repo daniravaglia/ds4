@@ -4523,6 +4523,42 @@ static int cuda_stream_batch_selected_prepare_from_host(
         }
     }
 
+    /* A layer of a small batch usually misses one to three experts. Split
+     * their tensors so the whole read pool streams them in parallel, as the
+     * one-token path does (DS4_ROCM_V41_BATCH_READ_CHUNKS=1 keeps one job per
+     * tensor). */
+    if (ok && use_fd && read_job_count != 0 &&
+        read_job_count * 2u <= DS4_ROCM_STREAM_READ_WORKERS) {
+        static int max_chunks = -1;
+        if (max_chunks < 0) {
+            const char *v = getenv("DS4_ROCM_V41_BATCH_READ_CHUNKS");
+            max_chunks = v && v[0] ? atoi(v) : 8;
+            if (max_chunks < 1) max_chunks = 1;
+        }
+        uint32_t chunks = DS4_ROCM_STREAM_READ_WORKERS / read_job_count;
+        if (chunks > (uint32_t)max_chunks) chunks = (uint32_t)max_chunks;
+        if (chunks > 1u) {
+            cuda_stream_read_job src[DS4_ROCM_STREAM_READ_WORKERS];
+            memcpy(src, read_jobs, (size_t)read_job_count * sizeof(read_jobs[0]));
+            uint32_t expanded = 0;
+            for (uint32_t i = 0; i < read_job_count; i++) {
+                const uint64_t bytes = src[i].bytes;
+                const uint64_t base_chunk = bytes / chunks, extra = bytes % chunks;
+                uint64_t off = 0;
+                for (uint32_t c = 0; c < chunks; c++) {
+                    const uint64_t chunk = base_chunk + ((uint64_t)c < extra ? 1u : 0u);
+                    if (chunk == 0) break;
+                    cuda_stream_read_job job = src[i];
+                    job.offset += off;
+                    job.dst += off;
+                    job.bytes = chunk;
+                    read_jobs[expanded++] = job;
+                    off += chunk;
+                }
+            }
+            read_job_count = expanded;
+        }
+    }
     if (ok && begin_pending) {
         memset(&g_stream_batch_selected_pending, 0,
                sizeof(g_stream_batch_selected_pending));

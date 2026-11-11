@@ -14065,10 +14065,10 @@ decode_again:
          * several tokens at a time. Not while tool-call syntax is forced
          * greedy or client stop strings could end the reply inside a block:
          * a V4.1 session cannot rewind cheaply. */
-        const bool lookup = !s->batched_mode && !greedy_tool_syntax &&
-            !j->req.ignore_eos && j->req.stops.len == 0 &&
-            ds4_session_lookup_available(slot->session);
-        ds4_session_set_lookup(slot->session, lookup);
+        const bool lookup_ok = !s->batched_mode && !greedy_tool_syntax &&
+            !j->req.ignore_eos && j->req.stops.len == 0;
+        const bool lookup = lookup_ok && ds4_session_lookup_available(slot->session);
+        ds4_session_set_lookup(slot->session, lookup_ok);
         if (!s->batched_mode &&
             (ds4_engine_mtp_draft_tokens(s->engine) > 1 || lookup) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)

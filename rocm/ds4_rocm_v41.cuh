@@ -1451,6 +1451,12 @@ __global__ static void v41_hc_ordered_prefetch_kernel(float *out,
     }
 }
 
+/* Rows the tiny-row kernels serve: six for prefill batches, sixteen while a
+ * speculative verify runs (prefill tail chunks of 7-16 rows keep their
+ * established kernels, so prefill results do not change). */
+static inline uint32_t v41_tiny_rows_max(void) {
+    return g_dspark_verify_mode ? 16u : 6u;
+}
 extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                              uint64_t weight_offset, uint32_t width, uint32_t outputs,
                                              uint32_t rows, const ds4_gpu_tensor *in) {
@@ -1477,6 +1483,21 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
             (float *)out->ptr, w, (const float *)in->ptr); break;
         }
         return cuda_ok(cudaGetLastError(), "V4.1 exact tiny-row Engram projection");
+    }
+    if (width == 6144u && outputs == 25600u && rows > 6u && rows <= v41_tiny_rows_max() &&
+        ds4_rocm_is_gfx1151() && !cuda_runtime_config()->graph_dump) {
+        /* Seven to sixteen rows: the tiny-row kernels in chunks (rows are
+         * independent; only the weight read repeats per chunk). */
+        for (uint32_t off = 0; off < rows;) {
+            uint32_t n = rows - off;
+            if (n > 6u) n = n == 7u ? 5u : 6u;   /* never leave a single row */
+            ds4_gpu_tensor x = {(float *)in->ptr + (uint64_t)off * width, (uint64_t)n * width * 4u, 0};
+            ds4_gpu_tensor y = {(float *)out->ptr + (uint64_t)off * outputs, (uint64_t)n * outputs * 4u, 0};
+            if (!ds4_gpu_dsv41_projection_rows(&y, model_map, model_size, weight_offset,
+                                               width, outputs, n, &x)) return 0;
+            off += n;
+        }
+        return 1;
     }
     if (width == 6144u && outputs == 25600u && rows >= 32u && rows <= 2048u &&
         ds4_rocm_is_gfx1151() && !g_quality_mode && !cuda_runtime_config()->graph_dump) {
@@ -1516,6 +1537,7 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
         /* Partial batches retain the existing per-row F32-input fallback. */
     }
     if (width == 20480u && outputs == 24u && rows >= 8u && rows <= 2048u &&
+        !(g_v41_decode_like_batch && rows <= 16u) &&   /* wide verifies: the tiny-row kernel below */
         ds4_rocm_is_gfx1151()) {
         const __half *w = (const __half *)cuda_model_range_ptr(
             model_map, weight_offset, weight_bytes, "f16");
@@ -1567,7 +1589,7 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
             return cuda_ok(cudaGetLastError(), "V4.1 F16 indexer query-B token-reuse projection");
         }
     }
-    if (width == 20480u && outputs == 24u && rows <= 6u &&
+    if (width == 20480u && outputs == 24u && rows <= v41_tiny_rows_max() &&
         ds4_rocm_is_gfx1151()) {
         const __half *w = (const __half *)cuda_model_range_ptr(
             model_map, weight_offset, weight_bytes, "V4.1 tiny HC F16");
@@ -1653,7 +1675,7 @@ extern "C" int ds4_gpu_dsv41_f32_projection_rows(ds4_gpu_tensor *out,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
         uint32_t width, uint32_t outputs, uint32_t rows, const ds4_gpu_tensor *in) {
     uint64_t weight_bytes = 0;
-    if (!width || !outputs || !rows || rows > 6u || !model_map ||
+    if (!width || !outputs || !rows || rows > v41_tiny_rows_max() || !model_map ||
         !cuda_u64_mul3_checked(width, outputs, sizeof(float), &weight_bytes) ||
         !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
         !cuda_tensor_has_elems2(in, width, rows, 4u) ||
@@ -1677,7 +1699,9 @@ extern "C" int ds4_gpu_dsv41_f32_projection_rows(ds4_gpu_tensor *out,
             if (rows == 1u) { V41_ROUTER_ROWS16(1u); }
             else if (rows == 2u) { V41_ROUTER_ROWS16(2u); }
             else if (rows == 3u) { V41_ROUTER_ROWS16(3u); }
-            else { V41_ROUTER_ROWS16(6u); }
+            else if (rows <= 6u) { V41_ROUTER_ROWS16(6u); }
+            else if (rows <= 12u) { V41_ROUTER_ROWS16(12u); }
+            else { V41_ROUTER_ROWS16(16u); }
 #undef V41_ROUTER_ROWS16
             return cuda_ok(cudaGetLastError(), "V4.1 tiny BF16 router projection");
         }
@@ -1689,7 +1713,9 @@ extern "C" int ds4_gpu_dsv41_f32_projection_rows(ds4_gpu_tensor *out,
         if (rows == 1u) { V41_ROUTER_ROWS(1u); }
         else if (rows == 2u) { V41_ROUTER_ROWS(2u); }
         else if (rows == 3u) { V41_ROUTER_ROWS(3u); }
-        else { V41_ROUTER_ROWS(6u); }
+        else if (rows <= 6u) { V41_ROUTER_ROWS(6u); }
+        else if (rows <= 12u) { V41_ROUTER_ROWS(12u); }
+        else { V41_ROUTER_ROWS(16u); }
 #undef V41_ROUTER_ROWS
         return cuda_ok(cudaGetLastError(), "V4.1 tiny F32 router projection");
     }
@@ -1906,6 +1932,26 @@ static int v41_q8_f32_tiny_rows_launch(float *out, const unsigned char *weights,
         case 5u: v41_q8_f32_tiny_rows_kernel<5u, GROUPS><<<outputs, 32u>>>(
             out, weights, input, width, rows_per_group, row_bytes); break;
         case 6u: v41_q8_f32_tiny_rows_kernel<6u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 7u: v41_q8_f32_tiny_rows_kernel<7u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 8u: v41_q8_f32_tiny_rows_kernel<8u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 9u: v41_q8_f32_tiny_rows_kernel<9u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 10u: v41_q8_f32_tiny_rows_kernel<10u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 11u: v41_q8_f32_tiny_rows_kernel<11u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 12u: v41_q8_f32_tiny_rows_kernel<12u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 13u: v41_q8_f32_tiny_rows_kernel<13u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 14u: v41_q8_f32_tiny_rows_kernel<14u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 15u: v41_q8_f32_tiny_rows_kernel<15u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 16u: v41_q8_f32_tiny_rows_kernel<16u, GROUPS><<<outputs, 32u>>>(
             out, weights, input, width, rows_per_group, row_bytes); break;
         default: return 0;
     }
@@ -2255,7 +2301,7 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
         v41_q8_f32_blocks4_kernel<<<(outputs + 7u) / 8u, 256u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
             width, outputs, (uint64_t)(width / 32u) * 34u);
-    } else if (rows <= 6u && ds4_rocm_is_gfx1151()) {
+    } else if (rows <= v41_tiny_rows_max() && ds4_rocm_is_gfx1151()) {
         return v41_q8_f32_tiny_rows_launch<1u>((float *)out->ptr, weights,
             (const float *)in->ptr, width, outputs, rows,
             (uint64_t)(width / 32u) * 34u);
@@ -2514,7 +2560,7 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
     const unsigned char *a = (const unsigned char *)cuda_model_range_ptr(model_map, out_a_offset, a_bytes, "V4.1 attn_out_a");
     const unsigned char *b = (const unsigned char *)cuda_model_range_ptr(model_map, out_b_offset, b_bytes, "V4.1 attn_out_b");
     if (!a || !b) return 0;
-    if (n_tokens >= 2u && n_tokens <= 6u && ds4_rocm_is_gfx1151()) {
+    if (n_tokens >= 2u && n_tokens <= v41_tiny_rows_max() && ds4_rocm_is_gfx1151()) {
         if (!v41_q8_f32_tiny_rows_launch<8u>((float *)low->ptr, a,
                 (const float *)heads->ptr, 4096u, 1024u, n_tokens,
                 UINT64_C(128) * 34u) ||

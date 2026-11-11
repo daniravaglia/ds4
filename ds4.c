@@ -40397,6 +40397,9 @@ static uint32_t ds41_engram_host_capacity(uint32_t prefill, uint32_t carry) {
 /* DSpark drafting keeps the target-layer main features and the projected
  * per-stage KV state in 128-row rings.  A verification pass snapshots the
  * resident trunk state that it may overwrite and restores its rejected tail. */
+/* Rows one V4.1 step batch (speculative verify, short prefill) can carry.
+ * The two-machine protocol keeps its own DS4_TP_BATCH_MAX_ROWS. */
+#define DS41_STEP_BATCH_MAX_ROWS 16
 #define DS41_DRAFT_WINDOW 128u
 typedef struct {
     const ds4_dspark_weights *w;
@@ -40407,7 +40410,7 @@ typedef struct {
     uint32_t skip_left, policy_cycles, policy_drafted, policy_accepted;
     /* Prompt lookup: where in the history the copy being followed continues,
      * and how many single-token steps have passed without a draft. */
-    uint32_t lk_cursor, lk_idle;
+    uint32_t lk_cursor, lk_idle, lk_streak;
     bool lk_valid;
     ds4_gpu_tensor *mh, *pending, *ring, *raw, *conf_proj, *markov_head_t;
     ds4_gpu_tensor *tokens, *conf, *parts, *logits, *x, *xn;
@@ -40442,6 +40445,7 @@ static void ds41_draft_reset(ds41_draft *d) {
     d->policy_accepted = 0;
     d->lk_cursor = 0;
     d->lk_idle = 0;
+    d->lk_streak = 0;
     d->lk_valid = false;
 }
 
@@ -40873,13 +40877,16 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }
 
+/* A speculative verify of up to sixteen rows is running (set around it). */
+static bool g_ds41_wide_verify;
 static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
     const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
     bool ok;
 #ifdef DS4_ROCM_BUILD
-    if (weight->type == DS4_TENSOR_F32 && count >= 2u && count <= 6u) {
+    if (weight->type == DS4_TENSOR_F32 && count >= 2u &&
+        count <= (g_ds41_wide_verify ? 16u : 6u)) {
         ok = ds4_gpu_dsv41_f32_projection_rows(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
         return ok && (!round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));
@@ -41932,7 +41939,11 @@ static bool ds41_hc_mix_batch(
         if (result < 0) return false;
         projected = result > 0 || ds41_matmul_batch(b->mix, m, fn, b->flat_norm, count, false);
     } else
-    projected = fn->type == DS4_TENSOR_F16 && count > DS4_TP_BATCH_MAX_ROWS ?
+    /* Speculative verifies of up to sixteen rows keep the small-row mixer
+     * (one launch reusing the weights); prefill tails keep their path. */
+    projected = fn->type == DS4_TENSOR_F16 &&
+            count > (g->draft && g->draft->verify_rows ? (uint32_t)DS41_STEP_BATCH_MAX_ROWS :
+                                                          (uint32_t)DS4_TP_BATCH_MAX_ROWS) ?
 #else
     const bool projected =
 #endif
@@ -42335,7 +42346,10 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 #ifdef DS4_ROCM_BUILD
         /* Window rows before this batch are still in the layer's ring (slot
          * pos % 128); this batch's own rows are b->kv. */
-        ok = g->tp_world == 1u && ds4_gpu_dsv41_attention_fp4_batch(b->heads, m->map, m->size,
+        /* Not for speculative verifies: packing every compressed row per
+         * call only pays off across a prefill chunk. */
+        ok = g->tp_world == 1u && !(g->draft && g->draft->verify_rows) &&
+            ds4_gpu_dsv41_attention_fp4_batch(b->heads, m->map, m->size,
             sinks, b->q, g->window[il], b->kv, g->compressed[owner], b->selected_comp,
             count, start, n_comp, DS4_N_INDEXER_TOP_K, 128, ratio, heads, DS4_N_HEAD_DIM) != 0;
         if (!ok)
@@ -42598,9 +42612,18 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
      * loads right after routing (waiting only on the router), so missing-expert
      * reads overlap the shared expert and the resident-expert compute (the
      * routed launch then takes the resident/missing split path). */
-    if (ok && !stage_selected && g->streaming && g->draft && count > 1u && count <= 8u &&
-        ds41_dspark_ssd_allowed() && getenv("DS4_ROCM_V41_DSPARK_SSD_PREFETCH")) {
-        int32_t ids[8u * 6u];
+    /* Prompt-lookup verifies always do this (DS4_ROCM_V41_LOOKUP_PREFETCH=0
+     * restores the synchronous read inside the routed launch). */
+    static int lookup_prefetch = -1;
+    if (lookup_prefetch < 0) {
+        const char *v = getenv("DS4_ROCM_V41_LOOKUP_PREFETCH");
+        lookup_prefetch = !(v && v[0] == '0');
+    }
+    if (ok && !stage_selected && g->streaming && g->draft && count > 1u &&
+        count <= (uint32_t)DS41_STEP_BATCH_MAX_ROWS &&
+        ((lookup_prefetch && !g->draft->w && g->draft->verify_rows) ||
+         (count <= 8u && ds41_dspark_ssd_allowed() && getenv("DS4_ROCM_V41_DSPARK_SSD_PREFETCH")))) {
+        int32_t ids[DS41_STEP_BATCH_MAX_ROWS * 6u];
         ds4_gpu_stream_expert_table table;
         if (DS4_N_EXPERT_USED == 6u && ds41_stream_table(m, l, il, &table) &&
             ds4_gpu_tensor_read(b->selected, 0, ids, (uint64_t)count * 6u * sizeof(int32_t)))
@@ -43187,9 +43210,12 @@ static bool ds41_draft_init(ds41_gpu_graph *g,
 }
 
 /* Verification state for prompt-lookup drafting: the buffers a multi-row
- * verify and its rollback need, without any drafter. Rows are capped at six
- * (the tiny-batch kernels). */
-#define DS41_LOOKUP_BLOCK 5u
+ * verify and its rollback need, without any drafter. A verification carries
+ * six rows, or twelve once three six-row drafts in a row were fully accepted
+ * (a long copy): on recorded agent sessions most copies are short, so wider
+ * drafts by default lose more to rejected rows than they gain. */
+#define DS41_LOOKUP_BLOCK 11u      /* widest draft: twelve rows per verification */
+#define DS41_LOOKUP_BASE_BLOCK 5u  /* usual draft: six rows */
 static bool ds41_lookup_enabled(void) {
 #ifdef DS4_ROCM_BUILD
     static int on = -1;
@@ -43206,6 +43232,12 @@ static bool ds41_lookup_init(ds41_gpu_graph *g) {
     if (g->lookup || g->draft || DS4_N_HC > 8u) return g->lookup != NULL;
     ds41_draft *d = xcalloc(1, sizeof(*d));
     d->block = DS41_LOOKUP_BLOCK;
+    {
+        /* DS4_V41_LOOKUP_ROWS: rows per verification (current token + drafts). */
+        const char *v = getenv("DS4_V41_LOOKUP_ROWS");
+        const int rows = v && v[0] ? atoi(v) : 0;
+        if (rows >= 2 && rows <= (int)DS4_DSPARK_MAX_BLOCK_SIZE) d->block = (uint32_t)rows - 1u;
+    }
     const uint64_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM, B = d->block;
     if (!(d->xn = ds4_gpu_tensor_alloc((B + 1u) * dim * sizeof(float))) ||
         !(d->saved = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER *
@@ -45267,7 +45299,7 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
                                    total, cancel, cancel_ud, false, false);
 }
 static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int count) {
-    if (!graphs || count < 2 || count > DS4_TP_BATCH_MAX_ROWS) return NULL;
+    if (!graphs || count < 2 || count > DS41_STEP_BATCH_MAX_ROWS) return NULL;
     ds41_gpu_graph *largest = NULL;
     for (int i = 0; i < count; i++) {
         ds41_gpu_graph *g = graphs[i];
@@ -45313,7 +45345,7 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights) {
-    if (!graphs || !tokens || count < 2 || count > DS4_TP_BATCH_MAX_ROWS ||
+    if (!graphs || !tokens || count < 2 || count > DS41_STEP_BATCH_MAX_ROWS ||
         prefill_rows > (uint32_t)count) return false;
     /* Sparse block masks scale with context, even when prefill caps match.
      * Attention and Engram history remain private to each session. */
@@ -45345,14 +45377,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds41_prefill_row active = {0};
-    ds4_engram_history history[DS4_TP_BATCH_MAX_ROWS];
-    uint32_t positions[DS4_TP_BATCH_MAX_ROWS];
+    ds4_engram_history history[DS41_STEP_BATCH_MAX_ROWS];
+    uint32_t positions[DS41_STEP_BATCH_MAX_ROWS];
     /* Only the leading prefill rows share a session. Keep their disk reads
      * and hash history distinct until the final row is published. */
     float (*engram)[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] = prefill_rows > 1 ?
         malloc(prefill_rows * sizeof(*engram)) : NULL;
-    ds4_gpu_tensor *queries[DS4_TP_BATCH_MAX_ROWS] = {0};
-    ds4_gpu_tensor *heads[DS4_TP_BATCH_MAX_ROWS] = {0};
+    ds4_gpu_tensor *queries[DS41_STEP_BATCH_MAX_ROWS] = {0};
+    ds4_gpu_tensor *heads[DS41_STEP_BATCH_MAX_ROWS] = {0};
     bool ok = rows <= g->prefill_cap && (prefill_rows <= 1 || engram);
 #define DS41_SESSION_VIEW(name, width) \
     if (ok) ok = (active.name = ds4_gpu_tensor_view(g->batch.name, 0, \
@@ -45394,7 +45426,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     bool any_images = false;
     for (int i = 0; i < count; i++) any_images = any_images || graphs[i]->image_count;
     if (ok && any_images) {
-        uint8_t text_mask[DS4_TP_BATCH_MAX_ROWS];
+        uint8_t text_mask[DS41_STEP_BATCH_MAX_ROWS];
         for (int i = 0; i < count; i++)
             text_mask[i] = ds41_image_at(graphs[i], positions[i]) ? 0u : 1u;
         ok = ds4_gpu_tensor_write(g->image_text_mask, 0, text_mask, (uint64_t)count) != 0;
@@ -45639,7 +45671,7 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
                               uint32_t n, float *logits_rows) {
     ds41_draft *d = g->draft;
     if (!d || !g->valid || n < 2u || n > d->block + 1u ||
-        n > DS4_TP_BATCH_MAX_ROWS || g->pos > g->ctx || n > g->ctx - g->pos)
+        n > DS41_STEP_BATCH_MAX_ROWS || g->pos > g->ctx || n > g->ctx - g->pos)
         return false;
 #ifdef DS4_ROCM_BUILD
     /* gfx1151's highly tuned resident one-row trunk is substantially faster
@@ -45676,7 +45708,7 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
         return ok;
     }
 #endif
-    ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
+    ds41_gpu_graph *graphs[DS41_STEP_BATCH_MAX_ROWS];
     for (uint32_t i = 0; i < n; i++) graphs[i] = g;
     d->verify_rows = n;
     d->mh_pos0 = g->pos;
@@ -45687,7 +45719,14 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
      * routed-MoE shapes used by V4.1; the model-specific dimensions remain
      * checked at each backend dispatch. */
     ds4_gpu_set_dspark_verify_mode(true);
-    ds4_gpu_set_v41_decode_like_batch(!d->w);
+    g_ds41_wide_verify = true;
+    {
+        /* The decode-arithmetic routed kernels also serve drafter verifies
+         * under SSD streaming (DS4_ROCM_V41_DSPARK_DECODE_LIKE=0: lookup only). */
+        static int all = -1;
+        if (all < 0) { const char *v = getenv("DS4_ROCM_V41_DSPARK_DECODE_LIKE"); all = !(v && v[0] == '0'); }
+        ds4_gpu_set_v41_decode_like_batch(!d->w || (all && g->streaming));
+    }
     const char *dense_env = getenv("DS4_ROCM_DSPARK_V41_GENERIC_DENSE");
     g_ds41_dspark_verify_dense = dense_env && dense_env[0] != '0';
 #endif
@@ -45720,6 +45759,7 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
     g_ds41_dspark_verify_dense = false;
     ds4_gpu_set_dspark_verify_mode(false);
     ds4_gpu_set_v41_decode_like_batch(false);
+    g_ds41_wide_verify = false;
 #endif
     d->verify_rows = 0;
     if (!ok) {
@@ -88735,22 +88775,28 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         lookup_k = kv && kv[0] ? atoi(kv) : (int)DS4_DSPARK_MAX_BLOCK_SIZE;
         if (lookup_k < 1) lookup_k = 1;
     }
-    const int lookup_min = lookup_only ? (lookup_env > 0 ? lookup_env : 4) : lookup_env;
+    const int lookup_min = !ds41_lookup_enabled() ? 0 : lookup_env > 0 ? lookup_env : 4;
     uint32_t lookup_n = 0, lookup_src = 0, lookup_match = 0;
-    if (lookup_min > 0 && (!lookup_only || (s->lookup_allowed && !d->skip_left)) &&
+    if (lookup_min > 0 && s->lookup_allowed && (!lookup_only || !d->skip_left) &&
         !tp_verify && !g->image_count && pos + B < g->ctx && max_tokens > 1 && accepted_cap > 1)
+    {
+        uint32_t width = lookup_only && d->lk_streak < 3u && B > DS41_LOOKUP_BASE_BLOCK ?
+            DS41_LOOKUP_BASE_BLOCK : B;
+        if ((uint32_t)lookup_k < width) width = (uint32_t)lookup_k;
         lookup_n = ds41_lookup_draft(s->checkpoint.v, pos, first_token, drafts,
-            (uint32_t)lookup_k < B ? (uint32_t)lookup_k : B, (uint32_t)lookup_min,
+            width, (uint32_t)lookup_min,
             d->lk_valid, d->lk_cursor, &lookup_src, &lookup_match);
+    }
     /* A short match is a guess: verify three tokens first (a three-row batch
      * pays for itself with one accepted token). */
     if (lookup_n > 2u && lookup_match < 4u) lookup_n = 2u;
     if (lookup_only && d->skip_left) d->skip_left--;
+    if (!lookup_n) d->lk_streak = 0;
     if (!lookup_n && d->lk_valid && ++d->lk_idle > 24u) d->lk_valid = false;
-    const bool proposed = lookup_min > 0 ? false : ds41_draft_should_propose(
+    const bool proposed = lookup_n ? false : ds41_draft_should_propose(
         draftable, cost_scheduled, tp_verify, d->skip_left,
         ds41_draft_adapt_off());
-    if (draftable && !proposed && lookup_min <= 0) {
+    if (draftable && !proposed && !lookup_n) {
         d->skip_left--;
         if (stats) s->dspark_stats.scheduler_skips++;
     }
@@ -88777,6 +88823,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
             if (!ignore_eos && drafts[i] == eos_token) { k = i; break; }
             if (ignore_eos && ds4_token_is_stop_for_think_mode(
                     e, drafts[i], think_mode)) { k = i; break; }
+            if (ds41_lookup_control_token(e, drafts[i])) { k = i; break; }
         }
     }
     if (lookup_n) {
@@ -88793,7 +88840,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
             /* Never draft a control token or past one: the caller's parser
              * state (tool calls, thinking, sampling mode) changes there and a
              * V4.1 session cannot rewind cheaply. */
-            if (lookup_only && ds41_lookup_control_token(e, drafts[i])) { k = i; break; }
+            if (ds41_lookup_control_token(e, drafts[i])) { k = i; break; }
         }
     }
     if (stats) {
@@ -88898,6 +88945,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         d->lk_cursor = lookup_src + matched + (matched < k ? 1u : 0u);
         d->lk_valid = true;
         d->lk_idle = 0;
+        d->lk_streak = matched == k && k >= DS41_LOOKUP_BASE_BLOCK ? d->lk_streak + 1u : 0u;
     }
     if (lookup_only) {
         g->draft = NULL;
@@ -88909,6 +88957,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         if (d->policy_cycles >= 8u) {
             /* Two of five, or one of two, is break-even. */
             if (5u * d->policy_accepted < 2u * d->policy_drafted) {
+                d->lk_streak = 0;
                 d->skip_left = 32u;
                 d->lk_valid = false;
             }

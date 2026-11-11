@@ -1351,7 +1351,7 @@ static int routed_moe_launch(
             decode_like_env = !(v && v[0] == '0');
         }
         const bool decode_like = decode_like_env && g_v41_decode_like_batch && iq2_path &&
-            !use_rocm_mmq_gateup && n_tokens <= 8u && stream_batch_unique != 0u &&
+            !use_rocm_mmq_gateup && n_tokens <= 16u && stream_batch_unique != 0u &&
             n_expert == 6u && (batch_stream_selected || batch_stream_split_selected);
         const dim3 dl_grid((expert_mid_dim + 3u) / 4u, stream_batch_unique, 1);
         if (ok && (batch_stream_selected || batch_stream_split_selected)) {
@@ -1361,7 +1361,7 @@ static int routed_moe_launch(
                     !getenv("DS4_ROCM_DISABLE_MOE_UNIQUE_BATCH");
                 const dim3 ugrid((expert_mid_dim + 127u) / 128u, stream_batch_unique, 1);
                 if (stream_batch_resident_count != 0u && decode_like) {
-                    moe_v41_gate_up_wave_unique_ptrs_kernel<4, 8u><<<dl_grid, 128>>>(
+                    moe_v41_gate_up_wave_unique_ptrs_kernel<4, 16u><<<dl_grid, 128>>>(
                             (float *)mid->ptr, resident_gate_slot_ptrs, resident_up_slot_ptrs, xq,
                             (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
                             gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
@@ -1404,7 +1404,7 @@ static int routed_moe_launch(
                     ok = cuda_stream_batch_selected_finish_pending_missing();
                 }
                 if (ok && stream_batch_missing_count != 0u && decode_like) {
-                    moe_v41_gate_up_wave_unique_ptrs_kernel<4, 8u><<<dl_grid, 128>>>(
+                    moe_v41_gate_up_wave_unique_ptrs_kernel<4, 16u><<<dl_grid, 128>>>(
                             (float *)mid->ptr, missing_gate_slot_ptrs, missing_up_slot_ptrs, xq,
                             (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
                             gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
@@ -1442,7 +1442,7 @@ static int routed_moe_launch(
                                  "routed_moe streaming batch missing gate/up launch");
                 }
             } else if (decode_like) {
-                moe_v41_gate_up_wave_unique_ptrs_kernel<4, 8u><<<dl_grid, 128>>>(
+                moe_v41_gate_up_wave_unique_ptrs_kernel<4, 16u><<<dl_grid, 128>>>(
                         (float *)mid->ptr, gate_slot_ptrs, up_slot_ptrs, xq,
                         (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
                         gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
