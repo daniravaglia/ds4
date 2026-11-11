@@ -88973,14 +88973,15 @@ static int ds41_session_spec(ds4_session *s, int first_token,
     }
     if (lookup_only) {
         g->draft = NULL;
-        /* A five-token draft pays for itself from two accepted tokens. After
-         * eight cycles averaging less, stop looking for a while. */
+        /* A five-token draft pays for itself from about two accepted tokens. */
         d->policy_cycles++;
         d->policy_accepted += matched;
         d->policy_drafted += k;
         if (d->policy_cycles >= 8u) {
-            /* Two of five, or one of two, is break-even. */
-            if (5u * d->policy_accepted < 2u * d->policy_drafted) {
+            /* Back off only from clearly unproductive stretches (under one
+             * accepted token in five drafted): on recorded agent sessions a
+             * stricter rule gave up gains made right after a bad stretch. */
+            if (5u * d->policy_accepted < d->policy_drafted) {
                 d->lk_streak = 0;
                 d->skip_left = 32u;
                 d->lk_valid = false;
