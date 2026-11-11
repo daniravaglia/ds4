@@ -56,6 +56,24 @@ int ds4_gpu_dsv41_hc_tail(ds4_gpu_tensor *split_out, const ds4_gpu_tensor *mix,
         uint64_t norm_weight_offset, float eps);
 int ds4_gpu_dsv41_bf16_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                             uint32_t start, bool compressed, bool inverse);
+int ds4_gpu_dsv41_router_bf16_rows(ds4_gpu_tensor *out, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t width, uint32_t outputs,
+        uint32_t rows, const ds4_gpu_tensor *in);
+int ds4_gpu_dsv41_q8_projection_pair_batch(ds4_gpu_tensor *out1, ds4_gpu_tensor *out2,
+        const void *model_map, uint64_t model_size, uint64_t offset1, uint64_t offset2,
+        uint32_t width, uint32_t outputs1, uint32_t outputs2, uint32_t rows,
+        const ds4_gpu_tensor *in);
+int ds4_gpu_dsv41_hc_wsum_norm_rows(ds4_gpu_tensor *x, ds4_gpu_tensor *norm_out,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *w, uint32_t w_stride,
+        const void *model_map, uint64_t model_size, uint64_t norm_weight_offset,
+        uint32_t rows, float eps);
+int ds4_gpu_dsv41_attention_fp4_batch(ds4_gpu_tensor *heads, const void *model_map,
+        uint64_t model_size, uint64_t sinks_offset, ds4_gpu_tensor *q, const ds4_gpu_tensor *ring,
+        const ds4_gpu_tensor *chunk, const ds4_gpu_tensor *comp_kv, const ds4_gpu_tensor *topk,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_comp, uint32_t top_k, uint32_t window,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim);
+int ds4_gpu_dsv41_bf16_rope_rows(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                                 uint32_t rows, uint32_t start, bool compressed, bool inverse);
 int ds4_gpu_dsv41_add_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
                            const ds4_gpu_tensor *b, uint32_t n);
 int ds4_gpu_hc_expand_split_bf16_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,
@@ -489,6 +507,18 @@ int ds4_gpu_dsv41_stream_prepare_layer_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected,
         uint32_t n_selected,
+        ds4_gpu_dsv41_stream_layer_plan *plan);
+/* Row count of the batch the next selected or top-up plan is for. Selected
+ * plans for batches the routed FP16 kernel takes stage only the experts read
+ * from disk and leave routed residents in the dynamic cache. */
+void ds4_gpu_dsv41_stream_selected_rows_hint(uint32_t rows);
+/* Keep what the loaded selected plan `prev` staged for this layer and plan
+ * reads only for the newly selected experts that are not staged yet. */
+int ds4_gpu_dsv41_stream_prepare_layer_topup(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t *selected,
+        uint32_t n_selected,
+        const ds4_gpu_dsv41_stream_layer_plan *prev,
         ds4_gpu_dsv41_stream_layer_plan *plan);
 int ds4_gpu_dsv41_stream_load_layer(
         ds4_gpu_dsv41_stream_layer_plan *plan);

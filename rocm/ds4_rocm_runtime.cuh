@@ -271,6 +271,14 @@ struct cuda_stream_layer_expert_cache {
     char *up;
     char *down;
     ds4_gpu_dsv41_stream_layer_plan reuse_plan;
+    /* V4.1 selected plans in pointer mode: the slot holds only the experts
+     * read from disk (in_slot); routed residents are read in place from the
+     * dynamic cache through per-expert pointer tables. */
+    uint64_t in_slot[6];
+    int pointer_mode;
+    /* Selected plan of a sweep whose larger chunks run on the routed FP16
+     * kernel: its short last chunk uses that kernel too, in either mode. */
+    int f16_any_rows;
 };
 
 struct cuda_stream_v41_reuse_stats {
@@ -3089,6 +3097,20 @@ static int cuda_stream_expert_cache_quiesce(void) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming quiesce could not prove GPU drainage; refusing teardown\n");
         abort();
     }
+    /* A slot staged for a selected plan holds only part of its layer (the
+     * experts that batch routed to). It is valid for that sweep alone: left
+     * active, the next multi-row batch at the same layer (a short append or a
+     * DSpark verify at layers 38/39) would take it for a full layer and read
+     * unstaged rows. Full-layer slots stay usable. */
+    for (uint32_t i = 0; i < 2u; i++) {
+        cuda_stream_layer_expert_cache &slot = g_stream_layer_expert_cache[i];
+        if (slot.reuse_plan.use_selected) {
+            slot.active = 0;
+            slot.pointer_mode = 0;
+            slot.f16_any_rows = 0;
+            memset(slot.in_slot, 0, sizeof(slot.in_slot));
+        }
+    }
     g_routed_moe_selected_override_n = 0;
     g_stream_selected_cache.loaded = 0;
     g_stream_selected_cache.model_map = NULL;
@@ -3314,6 +3336,31 @@ static int cuda_stream_layer_expert_cache_load(
     return 1;
 }
 
+/* Pointer mode for selected plans (default; DS4_ROCM_V41_SELECTED_NO_COPY=0
+ * restores the copies): only batches the routed FP16 kernel will take, since
+ * it is the only consumer that reads experts through pointer tables. */
+static int v41_routed_f16_enabled(void);
+static uint32_t v41_routed_f16_min_rows(void);
+static uint32_t g_stream_v41_selected_rows_hint;
+static int cuda_stream_v41_pointer_mode_wanted(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_SELECTED_NO_COPY");
+        on = !(v && v[0] == '0');
+    }
+    return on && g_deepseek41_model && !g_quality_mode && ds4_rocm_is_gfx1151() &&
+        v41_routed_f16_enabled() &&
+        g_stream_v41_selected_rows_hint >= v41_routed_f16_min_rows() &&
+        g_stream_v41_selected_rows_hint <= 2048u;
+}
+/* The batch this selected plan belongs to runs on the routed FP16 kernel. */
+static int cuda_stream_v41_selected_f16_batch(void) {
+    return g_deepseek41_model && !g_quality_mode && ds4_rocm_is_gfx1151() &&
+        v41_routed_f16_enabled() &&
+        g_stream_v41_selected_rows_hint >= v41_routed_f16_min_rows() &&
+        g_stream_v41_selected_rows_hint <= 2048u;
+}
+
 /* V4.1 only: the graph owns dynamic-cache metadata until every source copy
  * completes. The following reader receives no cache pointer or vector index. */
 static int cuda_stream_v41_prepare_layer_impl(const ds4_gpu_stream_expert_table *t,
@@ -3360,6 +3407,10 @@ static int cuda_stream_v41_prepare_layer_impl(const ds4_gpu_stream_expert_table 
     s.gate = s.base;
     s.up = s.gate + t->n_total_expert * t->gate_expert_bytes;
     s.down = s.up + t->n_total_expert * t->gate_expert_bytes;
+    const bool no_copy = use_selected && cuda_stream_v41_pointer_mode_wanted();
+    s.pointer_mode = no_copy ? 1 : 0;
+    s.f16_any_rows = use_selected && cuda_stream_v41_selected_f16_batch() ? 1 : 0;
+    memset(s.in_slot, 0, sizeof(s.in_slot));
     ds4_gpu_dsv41_stream_layer_plan plan = {};
     plan.table = *t;
     plan.generation = ++g_stream_v41_plan_generation;
@@ -3372,7 +3423,17 @@ static int cuda_stream_v41_prepare_layer_impl(const ds4_gpu_stream_expert_table 
         g_stream_v41_reuse_stats.prepares++;
         g_stream_v41_reuse_stats.logical_bytes += total;
     }
+    /* A selected plan stages only the experts its batch routes to: copying
+     * every resident of the layer cost ~22 ms per layer (2.1 GiB), 41 % of a
+     * 128-token append. DS4_ROCM_V41_SELECTIVE_COPY_ALL=1 restores that. */
+    static int copy_all = -1;
+    if (copy_all < 0) {
+        const char *v = getenv("DS4_ROCM_V41_SELECTIVE_COPY_ALL");
+        copy_all = v && v[0] && v[0] != '0';
+    }
     for (uint32_t e = 0; ok && e < 384u; e++) {
+        if (use_selected && !copy_all &&
+            !(selected_bits[e / 64u] & (UINT64_C(1) << (e % 64u)))) continue;
         const int idx = cuda_stream_resident_find(t->model_map, t->layer, (int32_t)e,
             t->gate_offset, t->up_offset, t->down_offset,
             t->gate_expert_bytes, t->down_expert_bytes);
@@ -3382,6 +3443,10 @@ static int cuda_stream_v41_prepare_layer_impl(const ds4_gpu_stream_expert_table 
         if (!entry.base || entry.bytes != expert_bytes || entry.gate != entry.base ||
             entry.up != entry.base + t->gate_expert_bytes ||
             entry.down != entry.base + 2u * t->gate_expert_bytes) continue;
+        if (no_copy) { /* read in place at launch; nothing to stage */
+            plan.hits[e / 64u] |= UINT64_C(1) << (e % 64u); hits++;
+            continue;
+        }
         if (!used_stream) {
             if (!cuda_stream_selected_upload_wait_host("V4.1 cached layer source ready") ||
                 !cuda_stream_batch_selected_upload_wait_host("V4.1 cached layer batch source ready") ||
@@ -3457,6 +3522,123 @@ static int cuda_stream_v41_prepare_layer_selected(const ds4_gpu_stream_expert_ta
                                                    uint32_t n_selected,
                                                    ds4_gpu_dsv41_stream_layer_plan *out) {
     return cuda_stream_v41_prepare_layer_impl(t, selected, n_selected, out);
+}
+
+/* Top up a slot that a selected plan (`prev`) already loaded for this layer:
+ * its contents stay (the residents copied when `prev` was prepared plus the
+ * experts `prev` read from disk) and the new plan reads only the experts in
+ * `selected` that are not there yet. No source copies are made. */
+static int cuda_stream_v41_prepare_layer_topup(const ds4_gpu_stream_expert_table *t,
+                                               const int32_t *selected,
+                                               uint32_t n_selected,
+                                               const ds4_gpu_dsv41_stream_layer_plan *prev,
+                                               ds4_gpu_dsv41_stream_layer_plan *out) {
+    if (!out || !prev || !prev->use_selected || !selected || !n_selected) return 0;
+    memset(out, 0, sizeof(*out));
+    uint64_t selected_bits[6] = {0};
+    uint32_t selected_unique = 0;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        const int32_t e = selected[i];
+        if (e < 0 || (uint32_t)e >= 384u) return 0;
+        const uint64_t bit = UINT64_C(1) << ((uint32_t)e % 64u);
+        if (!(selected_bits[(uint32_t)e / 64u] & bit)) {
+            selected_bits[(uint32_t)e / 64u] |= bit;
+            selected_unique++;
+        }
+    }
+    uint64_t total = 0;
+    if (!selected_unique || !g_ssd_streaming_mode || !cuda_stream_layer_table_bytes(t, &total) ||
+        t->n_total_expert != 384u || t->layer >= 40u || g_model_fd < 0 ||
+        g_model_fd_host_base != t->model_map ||
+        g_stream_selected_pending.active || g_stream_batch_selected_pending.active ||
+        g_stream_v41_plan_generation == UINT64_MAX) return 0;
+    pthread_mutex_lock(&g_stream_read_mutex);
+    const bool busy = g_stream_read_active_jobs != NULL;
+    pthread_mutex_unlock(&g_stream_read_mutex);
+    if (busy) return 0; /* Caller must join the previous layer loader. */
+    cuda_stream_layer_expert_cache &s = g_stream_layer_expert_cache[t->layer & 1u];
+    const ds4_gpu_stream_expert_table &pt = prev->table;
+    if (!s.active || !s.reserved || !s.base || s.capacity != total || s.bytes != total ||
+        s.layer != t->layer || s.model_map != t->model_map || s.model_size != t->model_size ||
+        s.n_total_expert != t->n_total_expert ||
+        s.gate_offset != t->gate_offset || s.up_offset != t->up_offset ||
+        s.down_offset != t->down_offset ||
+        s.gate_expert_bytes != t->gate_expert_bytes ||
+        s.down_expert_bytes != t->down_expert_bytes ||
+        pt.model_map != t->model_map || pt.layer != t->layer ||
+        pt.gate_offset != t->gate_offset || pt.up_offset != t->up_offset ||
+        pt.down_offset != t->down_offset ||
+        !s.reuse_plan.use_selected ||
+        memcmp(s.reuse_plan.hits, prev->hits, sizeof(prev->hits)) != 0 ||
+        memcmp(s.reuse_plan.selected, prev->selected, sizeof(prev->selected)) != 0 ||
+        !cuda_stream_layer_expert_cache_wait(s)) return 0;
+    const bool no_copy = cuda_stream_v41_pointer_mode_wanted();
+    if ((s.pointer_mode != 0) != no_copy) return 0; /* mode changed: re-prepare from scratch */
+    s.active = 0;
+    ds4_gpu_dsv41_stream_layer_plan plan = {};
+    plan.table = *t;
+    plan.generation = ++g_stream_v41_plan_generation;
+    for (uint32_t i = 0; i < 6u; i++) {
+        /* Pointer mode: only what was read is in the slot; residency is
+         * re-checked below because the cache may have changed since `prev`. */
+        plan.hits[i] = no_copy ? s.in_slot[i] : (prev->hits[i] | prev->selected[i]);
+        plan.selected[i] = selected_bits[i];
+    }
+    /* Newly selected experts that are resident in the dynamic cache are
+     * copied, as a fresh selected prepare would do; the rest is read. */
+    const uint64_t expert_bytes = total / 384u;
+    bool used_stream = false;
+    int ok = 1;
+    for (uint32_t e = 0; ok && e < 384u; e++) {
+        const uint64_t bit = UINT64_C(1) << (e % 64u);
+        if (!(selected_bits[e / 64u] & bit) || (plan.hits[e / 64u] & bit)) continue;
+        const int idx = cuda_stream_resident_find(t->model_map, t->layer, (int32_t)e,
+            t->gate_offset, t->up_offset, t->down_offset,
+            t->gate_expert_bytes, t->down_expert_bytes);
+        if (idx < 0) continue;
+        const cuda_stream_resident_expert &entry = g_stream_resident_experts[(size_t)idx];
+        if (!entry.base || entry.bytes != expert_bytes || entry.gate != entry.base ||
+            entry.up != entry.base + t->gate_expert_bytes ||
+            entry.down != entry.base + 2u * t->gate_expert_bytes) continue;
+        if (no_copy) { plan.hits[e / 64u] |= bit; continue; }
+        if (!used_stream) {
+            if (!cuda_stream_selected_upload_wait_host("V4.1 top-up source ready") ||
+                !cuda_stream_batch_selected_upload_wait_host("V4.1 top-up batch source ready") ||
+                !cuda_stream_selected_ensure_stream()) { ok = 0; break; }
+            used_stream = true;
+        }
+        const char *src[] = {entry.gate, entry.up, entry.down};
+        char *dst[] = {s.gate + e * t->gate_expert_bytes,
+                       s.up + e * t->gate_expert_bytes,
+                       s.down + e * t->down_expert_bytes};
+        const uint64_t bytes[] = {t->gate_expert_bytes, t->gate_expert_bytes,
+                                  t->down_expert_bytes};
+        for (uint32_t i = 0; ok && i < 3u; i++)
+            ok = cuda_ok(cudaMemcpyAsync(dst[i], src[i], (size_t)bytes[i],
+                            cudaMemcpyDeviceToDevice, g_stream_selected_upload_stream),
+                         "V4.1 cached expert to layer top-up copy");
+        if (ok) plan.hits[e / 64u] |= bit;
+    }
+    if (used_stream &&
+        !cuda_ok(cudaStreamSynchronize(g_stream_selected_upload_stream),
+                 "V4.1 top-up copy drain")) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "V4.1 top-up copy drainage unproven; refusing cache reuse or teardown\n");
+        abort();
+    }
+    if (!ok) return 0; /* The slot stays inactive; the caller re-prepares it. */
+    uint32_t present = 0, missing = 0;
+    for (uint32_t i = 0; i < 6u; i++) {
+        present += (uint32_t)__builtin_popcountll(plan.hits[i]);
+        missing += (uint32_t)__builtin_popcountll(selected_bits[i] & ~plan.hits[i]);
+    }
+    plan.selected_experts = selected_unique;
+    plan.use_selected = 1;
+    plan.resident_experts = present;
+    plan.missing_experts = missing;
+    plan.missing_bytes = (uint64_t)missing * expert_bytes;
+    s.reuse_plan = plan;
+    *out = plan;
+    return 1;
 }
 
 static int cuda_stream_v41_plan_matches(const ds4_gpu_dsv41_stream_layer_plan *p) {
@@ -3580,7 +3762,53 @@ static int cuda_stream_v41_load_layer(ds4_gpu_dsv41_stream_layer_plan *p) {
     s.gate_offset = t.gate_offset;
     s.up_offset = t.up_offset;
     s.down_offset = t.down_offset;
+    for (uint32_t i = 0; i < 6u; i++)
+        s.in_slot[i] |= p->use_selected ? (p->selected[i] & ~p->hits[i]) : ~UINT64_C(0);
     s.active = 1;
+    return 1;
+}
+
+/* Per-expert weight pointers for a pointer-mode slot: its own rows for the
+ * experts read from disk, the dynamic-cache entry for routed residents.
+ * *pointer_mode = 0 (and no tables) for ordinary slots. Returns 0 if a routed
+ * resident is gone, which would mean the cache changed between the stage and
+ * the launch. The tables are uploaded on the compute stream. */
+static int cuda_stream_v41_layer_pointer_tables(const void *model_map, uint32_t layer,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        const void *const **gate_table, const void *const **up_table,
+        const void *const **down_table, int *pointer_mode) {
+    static const void *host[3][384];
+    static void *dev = NULL;
+    *pointer_mode = 0;
+    if (layer >= 40u) return 1;
+    const cuda_stream_layer_expert_cache &s = g_stream_layer_expert_cache[layer & 1u];
+    if (!s.active || s.layer != layer || s.model_map != model_map || !s.pointer_mode) return 1;
+    if (!s.reuse_plan.use_selected) return 0;
+    for (uint32_t e = 0; e < 384u; e++) {
+        const uint64_t bit = UINT64_C(1) << (e % 64u);
+        host[0][e] = host[1][e] = host[2][e] = NULL;
+        if (s.in_slot[e / 64u] & bit) {
+            host[0][e] = s.gate + (uint64_t)e * gate_expert_bytes;
+            host[1][e] = s.up + (uint64_t)e * gate_expert_bytes;
+            host[2][e] = s.down + (uint64_t)e * down_expert_bytes;
+        } else if (s.reuse_plan.selected[e / 64u] & bit) {
+            const int idx = cuda_stream_resident_find(model_map, layer, (int32_t)e,
+                gate_offset, up_offset, down_offset, gate_expert_bytes, down_expert_bytes);
+            if (idx < 0) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX "V4.1 pointer-mode expert %u of layer %u left the cache before launch\n", e, layer);
+                return 0;
+            }
+            const cuda_stream_resident_expert &entry = g_stream_resident_experts[(size_t)idx];
+            host[0][e] = entry.gate; host[1][e] = entry.up; host[2][e] = entry.down;
+        }
+    }
+    if (!dev && !cuda_ok(cudaMalloc(&dev, sizeof(host)), "V4.1 expert pointer tables")) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(dev, host, sizeof(host), cudaMemcpyHostToDevice, 0),
+                 "V4.1 expert pointer table upload")) return 0;
+    const void *const *base = (const void *const *)dev;
+    *gate_table = base; *up_table = base + 384; *down_table = base + 768;
+    *pointer_mode = 1;
     return 1;
 }
 

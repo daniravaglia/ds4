@@ -191,6 +191,66 @@ __global__ __launch_bounds__(1024) static void v41_hc_tail_kernel(
     for (uint32_t i = tid; i < N; i += 1024u) norm_out[i] = v41_bf16(xs[i] * scale * nw[i]);
 }
 
+/* The weighted-sum and norm part of v41_hc_tail_kernel for a batch of rows:
+ * x[d] = bf16(sum_h residual[h][d] * w[h]), norm_out = bf16(rms_norm(x) * nw),
+ * one block per row. Same per-element arithmetic and reduction tree as
+ * hc_weighted_sum_kernel + v41_bf16_kernel + rms_norm_batched_kernel<true> +
+ * v41_bf16_kernel. */
+__global__ __launch_bounds__(1024) static void v41_hc_wsum_norm_rows_kernel(
+        const float *w, uint32_t w_stride, const float *residual, float *x,
+        float *norm_out, const float *nw, float eps) {
+    constexpr uint32_t N = 5120u;
+    __shared__ float xs[N];
+    __shared__ float partial[256];
+    const uint32_t tid = threadIdx.x;
+    const uint64_t row = blockIdx.x;
+    const float *wr = w + row * w_stride;
+    const float *res = residual + row * 4u * N;
+    float *xr = x + row * N;
+    float *no = norm_out + row * N;
+    for (uint32_t d = tid; d < N; d += 1024u) {
+        float acc = 0.0f;
+        for (uint32_t h = 0; h < 4u; h++) acc += res[(uint64_t)h * N + d] * wr[h];
+        const float v = v41_bf16(acc);
+        xr[d] = v;
+        xs[d] = v;
+    }
+    __syncthreads();
+    if (tid < 256u) {
+        float sum = 0.0f;
+        for (uint32_t i = tid; i < N; i += 256u) {
+            const float v = xs[i];
+            sum += v * v;
+        }
+        partial[tid] = sum;
+    }
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)N + eps);
+    for (uint32_t i = tid; i < N; i += 1024u) no[i] = v41_bf16(xs[i] * scale * nw[i]);
+}
+
+extern "C" int ds4_gpu_dsv41_hc_wsum_norm_rows(ds4_gpu_tensor *x, ds4_gpu_tensor *norm_out,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *w, uint32_t w_stride,
+        const void *model_map, uint64_t model_size, uint64_t norm_weight_offset,
+        uint32_t rows, float eps) {
+    if (!x || !norm_out || !residual || !w || !model_map || !rows || w_stride < 4u ||
+        !cuda_tensor_has_elems2(x, 5120u, rows, 4u) ||
+        !cuda_tensor_has_elems2(norm_out, 5120u, rows, 4u) ||
+        !cuda_tensor_has_elems2(residual, 4u * 5120u, rows, 4u) ||
+        !cuda_tensor_has_elems2(w, w_stride, rows, 4u) ||
+        !cuda_model_range_fits(model_size, norm_weight_offset, 5120u * 4u)) return 0;
+    const float *nw = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
+                                                          5120u * 4u, "rms_weight");
+    if (!nw) return 0;
+    v41_hc_wsum_norm_rows_kernel<<<rows, 1024>>>((const float *)w->ptr, w_stride,
+        (const float *)residual->ptr, (float *)x->ptr, (float *)norm_out->ptr, nw, eps);
+    return cuda_ok(cudaGetLastError(), "V4.1 batched HC weighted sum + norm");
+}
+
 extern "C" int ds4_gpu_dsv41_hc_tail(ds4_gpu_tensor *split_out, const ds4_gpu_tensor *mix,
         const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset,
         uint32_t sinkhorn_iters, float hc_eps, const ds4_gpu_tensor *w,
@@ -314,6 +374,22 @@ extern "C" int ds4_gpu_dsv41_add_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor 
     v41_add_bf16_kernel<<<(n + 255u) / 256u, 256u>>>((float *)out->ptr, (const float *)a->ptr,
                                                     (const float *)b->ptr, n);
     return cuda_ok(cudaGetLastError(), "V4.1 add + bf16");
+}
+
+/* The same fused bf16 + RoPE kernel for consecutive rows starting at `start`. */
+extern "C" int ds4_gpu_dsv41_bf16_rope_rows(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                                            uint32_t rows, uint32_t start, bool compressed,
+                                            bool inverse) {
+    uint64_t elems = 0;
+    if (width < 64u || !heads || !rows || rows > 1048576u ||
+        (uint64_t)start + (uint64_t)(rows - 1u) >= 1048576u ||
+        (uint64_t)heads * rows > UINT32_MAX ||
+        !cuda_u64_mul3_checked(width, heads, rows, &elems) || !cuda_tensor_has_f32(x, elems)) return 0;
+    if (pthread_once(&v41_rope_once, v41_init_rope_frequencies)) return 0;
+    v41_rope_args args = {width, heads, start, 1u, inverse, {0}};
+    memcpy(args.frequencies, v41_rope_frequencies[compressed ? 1 : 0], sizeof(args.frequencies));
+    v41_bf16_rope_kernel<<<heads * rows, 32>>>((float *)x->ptr, args);
+    return cuda_ok(cudaGetLastError(), "V4.1 batched bf16 + RoPE");
 }
 
 extern "C" int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
@@ -1070,8 +1146,19 @@ extern "C" int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const 
         width > INT32_MAX || rows > INT32_MAX || (start + rows) / ratio > width ||
         !cuda_tensor_has_elems2(scores, width, rows, 4u) ||
         !cuda_tensor_has_elems2(selected, 512u, rows, 4u)) return 0;
+    /* The batched causal top-k used to start above 8192 visible rows; below
+     * that every row launched its own sort. It is bit-identical from 512
+     * visible rows (frontier logits at 4K/12K/24K, 2026-11-10) and cuts the
+     * top-k of a 24K prefill from 2.9 to 0.85 s.
+     * DS4_ROCM_V41_TOPK_BATCH_MIN=8192 restores the old crossover. */
+    static int batch_min = -1;
+    if (batch_min < 0) {
+        const char *v = getenv("DS4_ROCM_V41_TOPK_BATCH_MIN");
+        batch_min = v && v[0] ? atoi(v) : 512;
+        if (batch_min < 512) batch_min = 512;
+    }
     if (ds4_rocm_is_gfx1151() && rows >= 2u && rows <= 32u && width <= 65536u &&
-        (start + 1u) / ratio > 8192u)
+        (start + 1u) / ratio > (uint32_t)batch_min)
         return v41_indexer_topk_causal_batch((uint32_t *)selected->ptr, (const float *)scores->ptr,
                                              width, rows, start, ratio);
     for (uint32_t row = 0; row < rows; row++) {
@@ -1241,12 +1328,12 @@ extern "C" int ds4_gpu_dsv41_hc_project(ds4_gpu_dsv41_hc_plan **plan,
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint32_t rows, const ds4_gpu_tensor *input,
         ds4_gpu_tensor *full_heads_scratch) {
-    if (rows != 2048u || !ds4_rocm_is_gfx1151() ||
+    if (!rows || rows > 2048u || !ds4_rocm_is_gfx1151() ||
         g_quality_mode || cuda_runtime_config()->graph_dump || !g_rocblas_ready ||
         g_rocblas_f16_solution_set != DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) return 0;
     const uint64_t weight_bytes = UINT64_C(20480) * 24u * 2u;
-    const uint64_t in_bytes = UINT64_C(20480) * 2048u * 4u;
-    const uint64_t out_bytes = UINT64_C(24) * 2048u * 4u;
+    const uint64_t in_bytes = UINT64_C(20480) * rows * 4u;
+    const uint64_t out_bytes = UINT64_C(24) * rows * 4u;
     if (!plan || !model_map || !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
         !cuda_tensor_has_bytes(input, in_bytes) || !cuda_tensor_has_bytes(out, out_bytes)) return -1;
     if (!cuda_tensor_has_bytes(full_heads_scratch, v41_hc_scratch_bytes)) return 0;
@@ -1259,7 +1346,8 @@ extern "C" int ds4_gpu_dsv41_hc_project(ds4_gpu_dsv41_hc_plan **plan,
         !v41_hc_disjoint(weight, weight_bytes, out->ptr, out_bytes) ||
         !v41_hc_disjoint(weight, weight_bytes, input->ptr, in_bytes) ||
         !v41_hc_disjoint(weight, weight_bytes, full_heads_scratch->ptr, v41_hc_scratch_bytes)) return -1;
-    return v41_hc_plan_run(plan, (float *)out->ptr, weight, (const float *)input->ptr, full_heads_scratch->ptr);
+    return v41_hc_plan_run(plan, (float *)out->ptr, weight, (const float *)input->ptr,
+                           full_heads_scratch->ptr, rows);
 }
 
 /* Default Engram lane l consumes l+32*i, i=0..191, then the existing
@@ -1456,6 +1544,27 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
             v41_launch_f16_sharedx_token_reuse<4u, 512u>(
                 (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
             return cuda_ok(cudaGetLastError(), "V4.1 F16 32 token-reuse projection");
+        }
+        /* Indexer query-B (1280 -> 4096): same token-reuse kernel instead of
+         * one launch per row. DS4_ROCM_V41_INDEX_QB_BATCH=0 restores the loop. */
+        static int index_qb_batch = -1;
+        if (index_qb_batch < 0) {
+            const char *v = getenv("DS4_ROCM_V41_INDEX_QB_BATCH");
+            index_qb_batch = !(v && v[0] == '0');
+        }
+        if (index_qb_batch && width == 1280u && outputs == 4096u) {
+            static int qb_tt = -1;
+            if (qb_tt < 0) { const char *v = getenv("DS4_ROCM_V41_INDEX_QB_TT"); qb_tt = v && v[0] ? atoi(v) : 16; }
+            if (qb_tt == 16)
+                v41_launch_f16_sharedx_token_reuse<16u, 128u>(
+                    (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
+            else if (qb_tt == 8)
+                v41_launch_f16_sharedx_token_reuse<8u, 128u>(
+                    (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
+            else
+            v41_launch_f16_sharedx_token_reuse<4u, 128u>(
+                (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
+            return cuda_ok(cudaGetLastError(), "V4.1 F16 indexer query-B token-reuse projection");
         }
     }
     if (width == 20480u && outputs == 24u && rows <= 6u &&
@@ -1845,6 +1954,233 @@ extern "C" int ds4_gpu_dsv41_q8_projection_pair_rows(
     return cuda_ok(cudaGetLastError(), "V4.1 Q8 fused pair projection");
 }
 
+/* Batched sparse attention on the kernel from rocm/gufo_f16/ds41_v41.hip.cpp.
+ * It reads the compressed KV rows in their packed FP4 form (256 code bytes +
+ * 32 scale bytes per row instead of 2 KiB of F32), which is what bounds this
+ * step: every token gathers its 512 selected rows twice. The rows in the F32
+ * cache are already FP4 values (DS4_V41_FP4_E4M3, blocks of 16), so they are
+ * packed on the fly for each call; DS4_ROCM_V41_ATTN_FP4_CHECK=1 verifies
+ * that packing reproduces them exactly and reports mismatches.
+ * `ring` holds the window rows before pos0 at slot pos % window, `chunk` this
+ * batch's rows. Returns 1 done, 0 not applicable.
+ * DS4_ROCM_V41_ATTN_FP4=0 disables. */
+typedef struct ds41_fp4_rows { const uint8_t *codes; const uint8_t *scales; } ds41_fp4_rows;
+extern "C" int ds41_v41_fp4_store(const float *x, uint8_t *codes, uint8_t *scales, uint32_t n,
+                                  uint32_t block, int e4m3_scale);
+extern "C" int ds41_v41_fp4_fake_quant(float *x, uint32_t n, uint32_t block, int e4m3_scale);
+extern "C" int ds41_v41_attention(float *q, const float *ring, const float *chunk, uint32_t window,
+        uint32_t floor, ds41_fp4_rows comp, const uint32_t *idx, uint32_t k, uint32_t ratio,
+        const float *sinks, float *out, uint16_t *out_half, float *partial, uint32_t pos0,
+        uint32_t n, uint32_t heads, uint32_t head_dim, float scale, const float *inv_freq,
+        uint32_t rope_dim, float *rope_scratch);
+__global__ static void v41_count_diff_kernel(const float *a, const float *b, uint64_t n, uint32_t *count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && __float_as_uint(a[i]) != __float_as_uint(b[i])) atomicAdd(count, 1u);
+}
+extern "C" int ds4_gpu_dsv41_attention_fp4_batch(ds4_gpu_tensor *heads, const void *model_map,
+        uint64_t model_size, uint64_t sinks_offset, ds4_gpu_tensor *q, const ds4_gpu_tensor *ring,
+        const ds4_gpu_tensor *chunk, const ds4_gpu_tensor *comp_kv, const ds4_gpu_tensor *topk,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_comp, uint32_t top_k, uint32_t window,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_ATTN_FP4");
+        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
+    }
+    if (!on || g_quality_mode || n_tokens < 8u || n_tokens > 2048u || !ratio || top_k != 512u ||
+        n_comp < top_k || window != 128u || n_head != 64u || head_dim != 512u ||
+        !heads || !q || !ring || !chunk || !comp_kv || !topk || !model_map ||
+        (uint64_t)n_comp * head_dim > UINT32_MAX ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        ring->bytes < (uint64_t)window * head_dim * sizeof(float) ||
+        chunk->bytes < (uint64_t)n_tokens * head_dim * sizeof(float) ||
+        comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
+        topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t) ||
+        !cuda_model_range_fits(model_size, sinks_offset, (uint64_t)n_head * sizeof(float))) return 0;
+    const float *sinks = (const float *)cuda_model_range_ptr(model_map, sinks_offset,
+        (uint64_t)n_head * sizeof(float), "attn_sinks");
+    if (!sinks) return 0;
+    static uint8_t *codes = NULL, *scales = NULL;
+    static uint32_t cap_rows = 0;
+    if (n_comp > cap_rows) {
+        if (codes) (void)cudaFree(codes);
+        if (scales) (void)cudaFree(scales);
+        codes = scales = NULL; cap_rows = 0;
+        const uint32_t want = n_comp < 16384u ? 16384u : n_comp + n_comp / 4u;
+        if (!cuda_ok(cudaMalloc(&codes, (size_t)want * (head_dim / 2u)), "V4.1 FP4 KV codes") ||
+            !cuda_ok(cudaMalloc(&scales, (size_t)want * (head_dim / 16u)), "V4.1 FP4 KV scales")) return 0;
+        cap_rows = want;
+    }
+    const uint32_t n_values = n_comp * head_dim;
+    static int check = -1;
+    if (check < 0) check = getenv("DS4_ROCM_V41_ATTN_FP4_CHECK") != NULL;
+    if (check) {
+        float *tmp = NULL; uint32_t *cnt = NULL; uint32_t diff = 0;
+        if (cuda_ok(cudaMalloc(&tmp, (size_t)n_values * sizeof(float)), "V4.1 FP4 check") &&
+            cuda_ok(cudaMalloc(&cnt, sizeof(uint32_t)), "V4.1 FP4 check count")) {
+            (void)cudaMemcpy(cnt, &diff, sizeof(diff), cudaMemcpyHostToDevice);
+            (void)cudaMemcpy(tmp, comp_kv->ptr, (size_t)n_values * sizeof(float), cudaMemcpyDeviceToDevice);
+            (void)ds41_v41_fp4_fake_quant(tmp, n_values, 16u, 1);
+            v41_count_diff_kernel<<<(unsigned)((n_values + 255u) / 256u), 256u>>>(tmp,
+                (const float *)comp_kv->ptr, n_values, cnt);
+            (void)cudaMemcpy(&diff, cnt, sizeof(diff), cudaMemcpyDeviceToHost);
+            static uint64_t calls = 0, bad = 0;
+            calls++; bad += diff;
+            if (diff || (calls % 64u) == 1u)
+                fprintf(stderr, "ds4: V4.1 FP4 KV check call=%llu rows=%u mismatched values=%u (total %llu)\n",
+                        (unsigned long long)calls, n_comp, diff, (unsigned long long)bad);
+        }
+        if (tmp) (void)cudaFree(tmp);
+        if (cnt) (void)cudaFree(cnt);
+    }
+    if (ds41_v41_fp4_store((const float *)comp_kv->ptr, codes, scales, n_values, 16u, 1)) return 0;
+    const ds41_fp4_rows comp = {codes, scales};
+    if (ds41_v41_attention((float *)q->ptr, (const float *)ring->ptr, (const float *)chunk->ptr,
+            window, 0u, comp, (const uint32_t *)topk->ptr, top_k, ratio, sinks,
+            (float *)heads->ptr, NULL, NULL, pos0, n_tokens, n_head, head_dim,
+            1.0f / sqrtf((float)head_dim), NULL, 0u, NULL)) return 0;
+    static int logged = 0;
+    if (!logged) { logged = 1; fprintf(stderr, "ds4: ROCm V4.1 FP4-row attention active (rows=%u)\n", n_tokens); }
+    return 1;
+}
+
+/* Router projection (F32 384 x 5120) on the BF16 matrix cores
+ * (rocm/gufo_f16/ds41_v41.hip.cpp). The router weights are BF16 values stored
+ * as F32, so their BF16 copy is exact; it is made once per layer and kept.
+ * The kernel splits each F32 activation into three BF16 terms, so every
+ * product is exact and only the summation order differs from SGEMM.
+ * Returns 1 done, 0 not applicable (caller uses its usual path).
+ * DS4_ROCM_V41_ROUTER_BF16=0 disables. */
+extern "C" int ds41_v41_matmul_bf16(const uint16_t *w, const float *x, float *out, uint32_t rows,
+                                    uint32_t k, uint32_t n);
+__global__ static void v41_f32_to_bf16_exact_kernel(uint16_t *out, const float *in, uint64_t n,
+                                                   uint32_t *inexact) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint32_t bits = __float_as_uint(in[i]);
+    out[i] = (uint16_t)(bits >> 16);
+    if (bits & 0xffffu) atomicOr(inexact, 1u);
+}
+extern "C" int ds4_gpu_dsv41_router_bf16_rows(ds4_gpu_tensor *out, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t width, uint32_t outputs,
+        uint32_t rows, const ds4_gpu_tensor *in) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_ROUTER_BF16");
+        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
+    }
+    if (!on || g_quality_mode || rows < 16u || rows > 2048u || outputs != 384u || width != 5120u ||
+        !model_map || !cuda_tensor_has_elems2(in, width, rows, 4u) ||
+        !cuda_tensor_has_elems2(out, outputs, rows, 4u) ||
+        ((uintptr_t)in->ptr % 16u) != 0u) return 0;
+    const uint64_t n = (uint64_t)outputs * width;
+    if (!cuda_model_range_fits(model_size, weight_offset, n * sizeof(float))) return 0;
+    struct entry { const void *map; uint64_t offset; uint16_t *w; int state; };
+    static entry cache[64];
+    entry *e = NULL;
+    for (uint32_t i = 0; i < 64u; i++) {
+        if (cache[i].state && cache[i].map == model_map && cache[i].offset == weight_offset) { e = &cache[i]; break; }
+        if (!cache[i].state) {
+            const float *w32 = (const float *)cuda_model_range_ptr(model_map, weight_offset,
+                n * sizeof(float), "V4.1 router F32");
+            if (!w32) return 0;
+            uint16_t *w16 = NULL; uint32_t *flag = NULL;
+            if (!cuda_ok(cudaMalloc(&w16, n * sizeof(uint16_t)), "V4.1 router BF16 weights") ||
+                !cuda_ok(cudaMalloc(&flag, sizeof(uint32_t)), "V4.1 router BF16 check")) return 0;
+            uint32_t inexact = 0;
+            if (!cuda_ok(cudaMemcpy(flag, &inexact, sizeof(inexact), cudaMemcpyHostToDevice), "V4.1 router BF16 check reset")) return 0;
+            v41_f32_to_bf16_exact_kernel<<<(unsigned)((n + 255u) / 256u), 256u>>>(w16, w32, n, flag);
+            if (!cuda_ok(cudaGetLastError(), "V4.1 router BF16 convert") ||
+                !cuda_ok(cudaMemcpy(&inexact, flag, sizeof(inexact), cudaMemcpyDeviceToHost), "V4.1 router BF16 check read")) return 0;
+            (void)cudaFree(flag);
+            cache[i].map = model_map; cache[i].offset = weight_offset;
+            if (inexact) {
+                /* Not BF16 values: keep SGEMM for this matrix. */
+                (void)cudaFree(w16);
+                cache[i].w = NULL; cache[i].state = 2;
+                fprintf(stderr, "ds4: V4.1 router weights at %llu are not exact BF16; keeping SGEMM\n",
+                        (unsigned long long)weight_offset);
+            } else {
+                cache[i].w = w16; cache[i].state = 1;
+            }
+            e = &cache[i];
+            break;
+        }
+    }
+    if (!e || e->state != 1 || ((uintptr_t)e->w % 16u) != 0u) return 0;
+    if (ds41_v41_matmul_bf16(e->w, (const float *)in->ptr, (float *)out->ptr, outputs, width, rows)) return 0;
+    static int logged = 0;
+    if (!logged) { logged = 1; fprintf(stderr, "ds4: ROCm V4.1 router on BF16 matrix cores active (rows=%u)\n", rows); }
+    return 1;
+}
+
+/* Dense Q8_0 projections on the FP16 matrix cores (rocm/gufo_f16, see its
+ * NOTICE.md). Same operand rounding as the WMMA row-tile kernels (FP16
+ * activations and decoded weights, FP32 accumulation); only the summation
+ * order differs. DS4_ROCM_V41_DENSE_F16=0 restores the row-tile kernels. */
+extern "C" int ds41_v41_dense_f16(int type, const void *w, const void *x, void *out, uint32_t m,
+                                  uint32_t n, uint32_t k, uint32_t groups, uint32_t io);
+static int v41_dense_f16_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_DENSE_F16");
+        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
+    }
+    return on;
+}
+static uint32_t v41_dense_f16_min_rows(void) {
+    static int rows = -1;
+    if (rows < 0) {
+        const char *v = getenv("DS4_ROCM_V41_DENSE_F16_MIN_ROWS");
+        rows = v && v[0] ? atoi(v) : 32;
+        if (rows < 2) rows = 2;
+    }
+    return (uint32_t)rows;
+}
+static void v41_dense_f16_log(const char *what, uint32_t rows) {
+    static int logged = 0;
+    if (!logged) {
+        logged = 1;
+        fprintf(stderr, "ds4: ROCm V4.1 dense FP16 projections active (%s rows=%u)\n", what, rows);
+    }
+}
+
+/* Two Q8_0 matrices over the same input rows in one launch (the same results
+ * as two ds41_v41_dense_f16 calls): shared-expert gate + up, and attention
+ * query-A + KV. Outputs are not rounded; the caller applies its BF16 passes.
+ * Returns 1 done, 0 not applicable. DS4_ROCM_V41_DENSE_PAIR=0 disables. */
+extern "C" int ds41_v41_dense_f16_pair(int type, const void *w1, void *out1, uint32_t m1,
+                                       const void *w2, void *out2, uint32_t m2, const void *x,
+                                       uint32_t n, uint32_t k, uint32_t io);
+extern "C" int ds4_gpu_dsv41_q8_projection_pair_batch(ds4_gpu_tensor *out1, ds4_gpu_tensor *out2,
+        const void *model_map, uint64_t model_size, uint64_t offset1, uint64_t offset2,
+        uint32_t width, uint32_t outputs1, uint32_t outputs2, uint32_t rows,
+        const ds4_gpu_tensor *in) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_DENSE_PAIR");
+        on = !(v && v[0] == '0');
+    }
+    uint64_t bytes1 = 0, bytes2 = 0;
+    if (!on || g_quality_mode || !v41_dense_f16_enabled() || rows < v41_dense_f16_min_rows() ||
+        rows > 2048u || !width || width % 256u || !outputs1 || outputs1 % 256u ||
+        !outputs2 || outputs2 % 256u || !model_map ||
+        !cuda_u64_mul3_checked(width / 32u, outputs1, 34u, &bytes1) ||
+        !cuda_u64_mul3_checked(width / 32u, outputs2, 34u, &bytes2) ||
+        !cuda_model_range_fits(model_size, offset1, bytes1) ||
+        !cuda_model_range_fits(model_size, offset2, bytes2) ||
+        !cuda_tensor_has_elems2(in, width, rows, 4u) ||
+        !cuda_tensor_has_elems2(out1, outputs1, rows, 4u) ||
+        !cuda_tensor_has_elems2(out2, outputs2, rows, 4u)) return 0;
+    const void *w1 = cuda_model_range_ptr(model_map, offset1, bytes1, "V4.1 Q8 pair A");
+    const void *w2 = cuda_model_range_ptr(model_map, offset2, bytes2, "V4.1 Q8 pair B");
+    if (!w1 || !w2) return 0;
+    if (ds41_v41_dense_f16_pair(8, w1, out1->ptr, outputs1, w2, out2->ptr, outputs2, in->ptr,
+                                rows, width, 0u)) return 0;
+    return 1;
+}
+
 extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                                 uint64_t weight_offset, uint32_t width, uint32_t outputs,
                                                 uint32_t rows, const ds4_gpu_tensor *in) {
@@ -1860,6 +2196,12 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
      * return value of 2 so the caller can drop its separate rounding pass. */
     const bool want_bf16 = ds4_q8_bf16_fused() && g_q8_round_request != 0;
     int rounded_in_kernel = 0;
+    if (!g_quality_mode && rows >= v41_dense_f16_min_rows() && rows <= 2048u &&
+        width % 256u == 0u && outputs % 256u == 0u && v41_dense_f16_enabled()) {
+        if (ds41_v41_dense_f16(8, weights, in->ptr, out->ptr, outputs, rows, width, 1u, 0u)) return 0;
+        v41_dense_f16_log("q8 projection", rows);
+        return 1;
+    }
     if (rows == 1u && ds4_rocm_is_gfx1151()) {
         v41_q8b4_prefetch_publish();
         v41_q8b4_log_shape("rows1", width, outputs, (uint64_t)(width / 32u) * 34u, rows);
@@ -2144,6 +2486,15 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
             !v41_q8_f32_tiny_rows_launch<1u>((float *)out->ptr, b,
                 (const float *)low->ptr, 8192u, 5120u, n_tokens,
                 UINT64_C(256) * 34u)) return 0;
+        return 1;
+    }
+    if (!g_quality_mode && n_tokens >= v41_dense_f16_min_rows() && n_tokens <= 2048u &&
+        v41_dense_f16_enabled()) {
+        /* Eight groups of 4096 -> 1024, the BF16 low boundary, then 8192 -> 5120. */
+        if (ds41_v41_dense_f16(8, a, heads->ptr, low->ptr, 1024u, n_tokens, 4096u, 8u, 0u) ||
+            !ds4_gpu_dsv41_quantize(low, 8192u, n_tokens, DS4_V41_BF16) ||
+            ds41_v41_dense_f16(8, b, low->ptr, out->ptr, 5120u, n_tokens, 8192u, 1u, 0u)) return 0;
+        v41_dense_f16_log("attention output", n_tokens);
         return 1;
     }
     bool low_rounded = false;
