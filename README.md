@@ -22,25 +22,35 @@
 >
 > Benchmark, `ds4-bench --rocm --ssd-streaming --ssd-streaming-cache-experts 92GB`,
 > model `DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf`, prompt
-> `speed-bench/promessi_sposi.txt`, 512 generated tokens, `make strix-halo`, 3 runs,
-> median shown (tok/s, higher is better). The first column was measured on
-> 2026-11-11, the other three on 2026-11-09 (clean builds, rotated order):
+> `speed-bench/promessi_sposi.txt`, 512 generated tokens, `make strix-halo`, median
+> shown (tok/s, higher is better). The first column was measured on 2026-11-12
+> (8 runs), the other three on 2026-11-09 (clean builds, 3 runs, rotated order):
 >
-> | Context | Metric | this fork (`afe74b7`) | this fork (`5bf1982`) | kyuz0/ds4 (`2998e96`) | antirez/ds4 (`b3f5018`) |
+> | Context | Metric | this fork (`95d42fc`) | this fork (`5bf1982`) | kyuz0/ds4 (`2998e96`) | antirez/ds4 (`b3f5018`) |
 > |---|---|---|---|---|---|
-> | 8K | prefill | **342.3** | 201.7 | 169.3 | 71.5 |
-> | 8K | decode | **14.34** | 12.25 | 9.13 | 4.66 |
-> | 32K | prefill (8K→32K) | **643.4** | 331.7 | 294.4 | 96.6 |
-> | 32K | decode | **14.21** | 12.05 | 8.33 | 4.41 |
+> | 8K | prefill | **342.0** | 201.7 | 169.3 | 71.5 |
+> | 8K | decode | **14.87** | 12.25 | 9.13 | 4.66 |
+> | 32K | prefill (8K→32K) | **640.6** | 331.7 | 294.4 | 96.6 |
+> | 32K | decode | **14.55** | 12.05 | 8.33 | 4.41 |
+>
+> **Prompt-lookup decoding** (server, on by default, `DS4_V41_LOOKUP=0` disables) is
+> not exercised by this benchmark. When the model reproduces text that is already in
+> the context (file rewrites and edits, tool-call arguments), the server drafts the
+> following tokens from the earlier occurrence and verifies several of them in one
+> batch; the model still decides every token. Measured through `ds4-server` on
+> 2026-11-11: a greedy file rewrite 13.2 -> 32.4 tok/s with byte-identical text, a
+> sampled `write_file` tool call (temperature 1.0) 13.4 -> 27.1 tok/s with an
+> identical result, prompts that copy little unchanged.
 >
 > Hardware: Strix Halo, 128 GB unified memory, model on a DRAM-less PCIe NVMe.
 > With SSD streaming the drive matters, and so does how the file is laid out on it:
 > the 2026-11-09 columns read the model file as first downloaded (~1-1.6 GB/s for
-> scattered expert reads); the `afe74b7` column reads a sequential copy of the same
+> scattered expert reads); the `95d42fc` column reads a sequential copy of the same
 > bytes (`dd bs=64M iflag=direct oflag=direct`), which the same drive serves at
-> 4.4-6 GB/s. That copy accounts for the decode gain and part of the 8K prefill gain;
-> the 8K→32K prefill gain is compute. Speed only; output quality is checked
-> separately with the official scorer.
+> 4.4-6 GB/s. That copy accounts for part of the decode gain and part of the 8K
+> prefill gain; the 8K→32K prefill gain is compute. The TuneD profile makes no
+> difference here: `balanced` and `accelerator-performance` measured the same.
+> Speed only; output quality is checked separately with the official scorer.
 
 **DwarfStar** aims to be the best way to run a few excellent large
 language models on consumer hardware (that is, hardware that people
