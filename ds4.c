@@ -40401,6 +40401,8 @@ static uint32_t ds41_engram_host_capacity(uint32_t prefill, uint32_t carry) {
  * The two-machine protocol keeps its own DS4_TP_BATCH_MAX_ROWS. */
 #define DS41_STEP_BATCH_MAX_ROWS 16
 #define DS41_DRAFT_WINDOW 128u
+struct ds41_lk_index;
+static void ds41_lk_index_free(struct ds41_lk_index *ix);
 typedef struct {
     const ds4_dspark_weights *w;
     const ds4_model *m;
@@ -40412,6 +40414,15 @@ typedef struct {
      * and how many single-token steps have passed without a draft. */
     uint32_t lk_cursor, lk_idle, lk_streak;
     bool lk_valid;
+    /* Cost-aware lookup policy (see ds41_lookup_width): running costs of a
+     * one-token step and of one verified row, and per match-length bucket the
+     * decayed drafted / accepted token counts and skipped opportunities. */
+    uint32_t lk_run;                 /* consecutive fully accepted drafts */
+    float lk_plain_ms, lk_row_ms;
+    float lk_acc[6], lk_drafted[6];
+    uint32_t lk_skipped[6];
+    uint64_t lk_stat_cycles, lk_stat_drafted, lk_stat_accepted, lk_stat_skipped;
+    struct ds41_lk_index *lk_index;  /* n-gram continuation counts of the session's tokens */
     ds4_gpu_tensor *mh, *pending, *ring, *raw, *conf_proj, *markov_head_t;
     ds4_gpu_tensor *tokens, *conf, *parts, *logits, *x, *xn;
     ds4_gpu_tensor *saved, *pool_kv, *pool_score;
@@ -40428,6 +40439,7 @@ static void ds41_draft_free(ds41_draft *d) {
     };
     for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++)
         ds4_gpu_tensor_free(tensors[i]);
+    ds41_lk_index_free(d->lk_index);
     free(d);
 }
 
@@ -40446,6 +40458,7 @@ static void ds41_draft_reset(ds41_draft *d) {
     d->lk_cursor = 0;
     d->lk_idle = 0;
     d->lk_streak = 0;
+    d->lk_run = 0;
     d->lk_valid = false;
 }
 
@@ -41806,7 +41819,7 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
             fprintf(stderr, "ds4: RD %u %u", g->pos, il);
             for (int k = 0; k < 16; k++) {
                 int best = -1; float bs = -1e30f;
-                for (int e = 0; e < DS4_N_EXPERT; e++) {
+                for (int e = 0; e < (int)DS4_N_EXPERT; e++) {
                     const float sc = probs[e] + b[e];
                     if (!used[e] && sc > bs) { bs = sc; best = e; }
                 }
@@ -88717,6 +88730,256 @@ static bool ds41_lookup_control_token(const ds4_engine *e, int token) {
     return false;
 }
 
+/* Frequency-scored lookup (the default proposer; DS4_V41_LOOKUP_PROPOSER=match
+ * restores the longest-match one below).
+ *
+ * For every position of the session's token history, six tables count which
+ * token followed the preceding 12, 8, 6, 4, 3 and 2 tokens. A draft is built
+ * by chaining: take the longest pattern that has been seen, propose its most
+ * frequent continuation, append it and repeat. How likely each step is to be
+ * accepted is not assumed but measured: every (pattern length, agreement)
+ * class keeps its own running hit rate from past verifications, where
+ * agreement is "always the same continuation, seen 3+ times", "... twice",
+ * "seen once", "a majority continuation" or "no majority". The expected
+ * number of accepted tokens of a width is the sum of the products of those
+ * rates, and the width is chosen as in ds41_lookup_width from the measured
+ * step and row costs (one-token drafts included). The idea is SuffixDecoding's
+ * (count-based scores over the request's own history, speculation length from
+ * expected acceptance), with a linear chain instead of a tree.
+ *
+ * Offline replay of two recorded agent sessions (word-piece proxy), speedup
+ * over one-token decoding at 18.5 / 25 / 30 / 35 ms per verified row:
+ * 1.26 / 1.12 / 1.06 / 1.04 on one and 1.11 / 1.05 / 1.02 / 1.00 on the
+ * other, against 1.18 / 1.09 / 1.03 / 1.01 and 1.01 / 1.00 / 1.00 / 0.99 for
+ * the longest-match proposer with the bucket policy. */
+#define DS41_LK_LEVELS 6u
+#define DS41_LK_BINS 5u
+#define DS41_LK_MAX_N 12u
+static const uint32_t ds41_lk_n[DS41_LK_LEVELS] = {12u, 8u, 6u, 4u, 3u, 2u};
+typedef struct {
+    uint64_t key;                /* 0: empty */
+    int32_t tok1, tok2;          /* the two leading continuations */
+    uint32_t cnt1, cnt2, total;
+} ds41_lk_entry;
+struct ds41_lk_index {
+    ds41_lk_entry *e[DS41_LK_LEVELS];
+    uint32_t mask;               /* slots per level - 1 */
+    uint32_t indexed;            /* history tokens counted so far */
+    uint64_t tail;               /* hash of the last indexed tokens, to detect a new history */
+    float cal_acc[DS41_LK_LEVELS][DS41_LK_BINS], cal_try[DS41_LK_LEVELS][DS41_LK_BINS];
+    uint32_t skipped;
+};
+static void ds41_lk_index_free(struct ds41_lk_index *ix) {
+    if (!ix) return;
+    for (uint32_t l = 0; l < DS41_LK_LEVELS; l++) free(ix->e[l]);
+    free(ix);
+}
+static uint64_t ds41_lk_hash(const int *t, uint32_t n, uint32_t level) {
+    uint64_t h = UINT64_C(1469598103934665603) ^ ((uint64_t)(level + 1u) << 56);
+    for (uint32_t i = 0; i < n; i++) {
+        h ^= (uint32_t)t[i];
+        h *= UINT64_C(1099511628211);
+        h ^= h >> 29;
+    }
+    return h ? h : 1u;
+}
+static ds41_lk_entry *ds41_lk_slot(struct ds41_lk_index *ix, uint32_t level, uint64_t key,
+                                   bool create) {
+    ds41_lk_entry *tab = ix->e[level];
+    uint32_t at = (uint32_t)(key ^ (key >> 32)) & ix->mask;
+    for (uint32_t probe = 0; probe < 16u; probe++, at = (at + 1u) & ix->mask) {
+        if (tab[at].key == key) return &tab[at];
+        if (!tab[at].key) {
+            if (!create) return NULL;
+            tab[at].key = key;
+            return &tab[at];
+        }
+    }
+    if (!create) return NULL;
+    /* A full neighbourhood: reuse the home slot (the table is sized at four
+     * slots per history token, so this is rare). */
+    at = (uint32_t)(key ^ (key >> 32)) & ix->mask;
+    memset(&tab[at], 0, sizeof(tab[at]));
+    tab[at].key = key;
+    return &tab[at];
+}
+static void ds41_lk_count(struct ds41_lk_index *ix, const int *hist, uint32_t i) {
+    for (uint32_t l = 0; l < DS41_LK_LEVELS; l++) {
+        const uint32_t n = ds41_lk_n[l];
+        if (i < n) continue;
+        ds41_lk_entry *e = ds41_lk_slot(ix, l, ds41_lk_hash(hist + i - n, n, l), true);
+        const int32_t next = hist[i];
+        e->total++;
+        if (e->cnt1 && e->tok1 == next) e->cnt1++;
+        else if (!e->cnt1) { e->tok1 = next; e->cnt1 = 1; }
+        else if (e->cnt2 && e->tok2 == next) {
+            if (++e->cnt2 > e->cnt1) {
+                const int32_t t = e->tok1; const uint32_t c = e->cnt1;
+                e->tok1 = e->tok2; e->cnt1 = e->cnt2; e->tok2 = t; e->cnt2 = c;
+            }
+        } else if (!e->cnt2 || e->cnt2 == 1u) { e->tok2 = next; e->cnt2 = 1; }
+    }
+}
+/* Bring the tables up to date with hist[0..len). A shorter history, or one
+ * whose recent tokens differ from what was indexed, starts over. */
+static struct ds41_lk_index *ds41_lk_sync(ds41_draft *d, const int *hist, uint32_t len,
+                                          uint32_t ctx) {
+    struct ds41_lk_index *ix = d->lk_index;
+    if (!ix) {
+        ix = calloc(1, sizeof(*ix));
+        if (!ix) return NULL;
+        uint32_t slots = 1024u;
+        while (slots < 4u * ctx && slots < (1u << 22)) slots <<= 1;
+        ix->mask = slots - 1u;
+        for (uint32_t l = 0; l < DS41_LK_LEVELS; l++) {
+            ix->e[l] = calloc(slots, sizeof(ds41_lk_entry));
+            if (!ix->e[l]) { ds41_lk_index_free(ix); return NULL; }
+            /* Starting hit rates: what two recorded agent sessions measured
+             * for each class (rows: pattern length 12..2; columns: the same
+             * continuation 3+ times, twice, seen once, a majority, none). A
+             * fresh session would otherwise need hundreds of probes before
+             * it trusts even a long exact copy. Weight: twelve trials. */
+            static const float prior[DS41_LK_LEVELS][DS41_LK_BINS] = {
+                {0.98f, 0.87f, 0.81f, 0.68f, 0.23f},
+                {0.95f, 0.85f, 0.75f, 0.65f, 0.23f},
+                {0.92f, 0.83f, 0.71f, 0.61f, 0.31f},
+                {0.96f, 0.83f, 0.60f, 0.72f, 0.13f},
+                {0.90f, 0.67f, 0.52f, 0.49f, 0.18f},
+                {0.83f, 0.58f, 0.28f, 0.52f, 0.09f},
+            };
+            for (uint32_t b = 0; b < DS41_LK_BINS; b++) {
+                ix->cal_acc[l][b] = prior[l][b] * 12.0f;
+                ix->cal_try[l][b] = 12.0f;
+            }
+        }
+        d->lk_index = ix;
+    }
+    const uint32_t tail_n = ix->indexed < 8u ? ix->indexed : 8u;
+    if (ix->indexed > len ||
+        (tail_n && ds41_lk_hash(hist + ix->indexed - tail_n, tail_n, 99u) != ix->tail)) {
+        for (uint32_t l = 0; l < DS41_LK_LEVELS; l++)
+            memset(ix->e[l], 0, ((size_t)ix->mask + 1u) * sizeof(ds41_lk_entry));
+        ix->indexed = 0;
+    }
+    if (ix->indexed < len) {
+        for (uint32_t i = ix->indexed; i < len; i++) ds41_lk_count(ix, hist, i);
+        ix->indexed = len;
+        const uint32_t n = len < 8u ? len : 8u;
+        ix->tail = n ? ds41_lk_hash(hist + len - n, n, 99u) : 0;
+    }
+    return ix;
+}
+/* Chain up to max_k predictions after hist[0..len) + seed. level[]/bin[]
+ * identify each step's calibration class and expect[] is the running product
+ * of the classes' hit rates. Returns the chain length. */
+static uint32_t ds41_lk_chain(struct ds41_lk_index *ix, const int *hist, uint32_t len, int seed,
+                              int *drafts, uint8_t *level, uint8_t *bin, float *expect,
+                              uint32_t max_k) {
+    int ctx[DS41_LK_MAX_N + DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
+    uint32_t m = len < DS41_LK_MAX_N - 1u ? len : DS41_LK_MAX_N - 1u;
+    memcpy(ctx, hist + len - m, (size_t)m * sizeof(int));
+    ctx[m++] = seed;
+    float p = 1.0f;
+    uint32_t k = 0;
+    while (k < max_k) {
+        const ds41_lk_entry *e = NULL;
+        uint32_t l = 0;
+        for (; l < DS41_LK_LEVELS; l++) {
+            const uint32_t n = ds41_lk_n[l];
+            if (m < n) continue;
+            e = ds41_lk_slot(ix, l, ds41_lk_hash(ctx + m - n, n, l), false);
+            if (e && e->cnt1) break;
+            e = NULL;
+        }
+        if (!e) break;
+        const uint32_t b = e->cnt1 == e->total ? (e->total >= 3u ? 0u : e->total == 2u ? 1u : 2u) :
+                           2u * e->cnt1 > e->total ? 3u : 4u;
+        p *= ix->cal_acc[l][b] / ix->cal_try[l][b];
+        drafts[k] = e->tok1;
+        level[k] = (uint8_t)l;
+        bin[k] = (uint8_t)b;
+        expect[k] = p;
+        k++;
+        ctx[m++] = e->tok1;
+    }
+    return k;
+}
+/* Width with the best expected tokens per time, or 0 (a one-token probe every
+ * 64 skipped opportunities keeps the hit rates current). */
+static uint32_t ds41_lk_pick(ds41_draft *d, struct ds41_lk_index *ix, const float *expect,
+                             uint32_t available) {
+    static const uint32_t widths[6] = {1u, 2u, 3u, 5u, 8u, 11u};
+    float best = 1.05f, sum = 0.0f;
+    uint32_t pick = 0, at = 0;
+    for (uint32_t i = 0; i < 6u && widths[i] <= available; i++) {
+        while (at < widths[i]) sum += expect[at++];
+        const float gain = (1.0f + sum) * d->lk_plain_ms /
+            (0.85f * d->lk_plain_ms + d->lk_row_ms * (float)(widths[i] + 1u));
+        if (gain > best) { best = gain; pick = widths[i]; }
+    }
+    if (!pick && available) {
+        d->lk_stat_skipped++;
+        if (++ix->skipped >= 64u) { ix->skipped = 0; pick = 1u; }
+    }
+    return pick;
+}
+
+/* How many lookup tokens to verify, or 0 for none.
+ *
+ * A verify of w drafts costs about one step plus w + 1 rows, and each row
+ * pays its own expert reads; at long context that is 25-35 ms per row, so a
+ * draft that is mostly rejected LOSES time. Recorded agent sessions differ a
+ * lot: file rewrites accept nearly everything, sessions of shell commands and
+ * numbers accept a third, and a fixed rule was 1.2x on one and 0.92-0.98x on
+ * another. So the decision is made from measurements: the running cost of a
+ * one-token step and of a verified row (both timed here), and the fraction of
+ * drafted tokens accepted so far for this kind of match (bucket: 2-3, 4-7,
+ * 8-15, 16-31, 32+ matching tokens, or the continuation of a fully accepted
+ * draft). A width is used only if it is expected to beat one-token decoding
+ * by 5 %; a bucket that keeps being skipped gets a two-token probe every 64
+ * opportunities so its statistics can recover. Replaying two sessions
+ * offline, this kept the gains (x1.19, 1.11, 1.06 at 18.5 / 25 / 30 ms per
+ * row) and held the bad case at 0.99-1.00 instead of 0.92-0.98. */
+static uint32_t ds41_lookup_bucket(const ds41_draft *d, uint32_t match) {
+    if (d->lk_run) return 5u;
+    return match < 4u ? 0u : match < 8u ? 1u : match < 16u ? 2u : match < 32u ? 3u : 4u;
+}
+static void ds41_lookup_policy_init(ds41_draft *d) {
+    static const float prior[6] = {0.45f, 0.50f, 0.65f, 0.70f, 0.85f, 0.90f};
+    if (d->lk_plain_ms > 0.0f) return;
+    d->lk_plain_ms = 75.0f;
+    d->lk_row_ms = 22.0f;
+    for (uint32_t b = 0; b < 6u; b++) {
+        d->lk_drafted[b] = 10.0f;
+        d->lk_acc[b] = prior[b] * 10.0f;
+    }
+}
+static uint32_t ds41_lookup_width(ds41_draft *d, uint32_t bucket, uint32_t available,
+                                  uint32_t wide) {
+    static int fixed = -1;
+    if (fixed < 0) fixed = getenv("DS4_V41_LOOKUP_FIXED_POLICY") != NULL;
+    if (fixed) return available;
+    const float rate = d->lk_acc[bucket] / d->lk_drafted[bucket];
+    const uint32_t widths[3] = {2u, DS41_LOOKUP_BASE_BLOCK, wide};
+    float best = 1.05f;
+    uint32_t pick = 0;
+    for (uint32_t i = 0; i < 3u; i++) {
+        const uint32_t w = widths[i];
+        if (w > available || (i == 2u && (d->lk_streak < 3u || w <= DS41_LOOKUP_BASE_BLOCK))) continue;
+        const float gain = (1.0f + (float)w * rate) * d->lk_plain_ms /
+            (0.85f * d->lk_plain_ms + d->lk_row_ms * (float)(w + 1u));
+        if (gain > best) { best = gain; pick = w; }
+    }
+    if (!pick) {
+        d->lk_stat_skipped++;
+        if (++d->lk_skipped[bucket] >= 64u) {
+            d->lk_skipped[bucket] = 0;
+            pick = available < 2u ? available : 2u;
+        }
+    }
+    return pick;
+}
+
 /* Prompt-lookup drafting: when the text being generated repeats text already
  * in the context (file edits, tool-call arguments, quotes), the tokens that
  * followed the previous occurrence are a free draft. Finds the most recent
@@ -88815,20 +89078,72 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         if (lookup_k < 1) lookup_k = 1;
     }
     const int lookup_min = !ds41_lookup_enabled() ? 0 : lookup_env > 0 ? lookup_env : 4;
-    uint32_t lookup_n = 0, lookup_src = 0, lookup_match = 0;
+    uint32_t lookup_n = 0, lookup_src = 0, lookup_match = 0, lookup_bucket = 0;
+    struct ds41_lk_index *lookup_ix = NULL;
+    uint8_t lookup_level[DS4_DSPARK_MAX_BLOCK_SIZE], lookup_bin[DS4_DSPARK_MAX_BLOCK_SIZE];
+    float lookup_expect[DS4_DSPARK_MAX_BLOCK_SIZE];
     if (lookup_min > 0 && s->lookup_allowed && (!lookup_only || !d->skip_left) &&
         !tp_verify && !g->image_count && pos + B < g->ctx && max_tokens > 1 && accepted_cap > 1)
     {
-        uint32_t width = lookup_only && d->lk_streak < 3u && B > DS41_LOOKUP_BASE_BLOCK ?
-            DS41_LOOKUP_BASE_BLOCK : B;
+        uint32_t width = B;
         if ((uint32_t)lookup_k < width) width = (uint32_t)lookup_k;
-        lookup_n = ds41_lookup_draft(s->checkpoint.v, pos, first_token, drafts,
-            width, (uint32_t)lookup_min,
-            d->lk_valid, d->lk_cursor, &lookup_src, &lookup_match);
+        ds41_lookup_policy_init(d);
+        static int freq = -1;
+        if (freq < 0) {
+            const char *v = getenv("DS4_V41_LOOKUP_PROPOSER");
+            freq = !(v && !strcmp(v, "match"));
+        }
+        lookup_ix = freq ? ds41_lk_sync(d, s->checkpoint.v, pos, g->ctx) : NULL;
+        if (lookup_ix) {
+            lookup_n = ds41_lk_chain(lookup_ix, s->checkpoint.v, pos, first_token, drafts,
+                                     lookup_level, lookup_bin, lookup_expect, width);
+            lookup_n = ds41_lk_pick(d, lookup_ix, lookup_expect, lookup_n);
+        } else {
+            lookup_n = ds41_lookup_draft(s->checkpoint.v, pos, first_token, drafts,
+                width, (uint32_t)lookup_min,
+                d->lk_valid, d->lk_cursor, &lookup_src, &lookup_match);
+            if (lookup_n) {
+                lookup_bucket = ds41_lookup_bucket(d, lookup_match);
+                lookup_n = ds41_lookup_width(d, lookup_bucket, lookup_n, width);
+            }
+        }
     }
-    /* A short match is a guess: verify three tokens first (a three-row batch
-     * pays for itself with one accepted token). */
-    if (lookup_n > 2u && lookup_match < 4u) lookup_n = 2u;
+    /* Diagnostic: DS4_V41_RECYCLE_STATS=1 measures what "token recycling"
+     * would accept without verifying anything: for every token it remembers
+     * the model's own top choice the last time that token was the latest one,
+     * and counts how often that remembered choice is the token chosen now,
+     * overall and where the lookup proposer has no draft. */
+    {
+        static int recycle = -1;
+        static int32_t *next_after;
+        static uint64_t tried, hit, tried_nl, hit_nl, steps;
+        if (recycle < 0) {
+            recycle = getenv("DS4_V41_RECYCLE_STATS") != NULL;
+            if (recycle) {
+                next_after = malloc((size_t)vocab * sizeof(*next_after));
+                if (!next_after) recycle = 0;
+                else memset(next_after, 0xff, (size_t)vocab * sizeof(*next_after));
+            }
+        }
+        if (recycle && pos >= 1u) {
+            const int prev = s->checkpoint.v[pos - 1u];
+            if (prev >= 0 && (uint32_t)prev < vocab) {
+                if (next_after[prev] >= 0) {
+                    tried++; hit += next_after[prev] == first_token;
+                    if (!lookup_n) { tried_nl++; hit_nl += next_after[prev] == first_token; }
+                }
+                next_after[prev] = sample_argmax(s->logits, vocab);
+            }
+            if ((++steps & 511u) == 0u)
+                fprintf(stderr, "ds4: V4.1 recycle stats steps=%llu remembered=%llu hit=%.1f%% | "
+                        "without a lookup draft: %llu hit=%.1f%%\n",
+                        (unsigned long long)steps, (unsigned long long)tried,
+                        tried ? 100.0 * (double)hit / (double)tried : 0.0,
+                        (unsigned long long)tried_nl,
+                        tried_nl ? 100.0 * (double)hit_nl / (double)tried_nl : 0.0);
+        }
+    }
+    if (!lookup_n) d->lk_run = 0;
     if (lookup_only && d->skip_left) d->skip_left--;
     if (!lookup_n) d->lk_streak = 0;
     if (!lookup_n && d->lk_valid && ++d->lk_idle > 24u) d->lk_valid = false;
@@ -88899,7 +89214,12 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         fprintf(stderr, "\n");
     }
     if (k == 0) {
+        const double t_plain = now_sec();
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        if (d->lk_plain_ms > 0.0f) {
+            const float ms = (float)((now_sec() - t_plain) * 1000.0);
+            if (ms > 20.0f && ms < 400.0f) d->lk_plain_ms = 0.95f * d->lk_plain_ms + 0.05f * ms;
+        }
         accepted[0] = first_token;
         ds41_draft_adapt(d, proposed, 0, 0, tp_verify);
         if (stats) {
@@ -88923,6 +89243,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         return -1;
     }
     const double tv = stats ? now_sec() : 0.0;
+    const double t_cycle = now_sec();
     if (lookup_only) g->draft = d;
     bool ok = ds41_draft_verify(g, &e->model, &e->weights,
                                 tokens, n, rows);
@@ -88985,24 +89306,41 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         d->lk_valid = true;
         d->lk_idle = 0;
         d->lk_streak = matched == k && k >= DS41_LOOKUP_BASE_BLOCK ? d->lk_streak + 1u : 0u;
+        d->lk_run = matched == k ? d->lk_run + 1u : 0u;
+        /* Policy statistics: what this kind of draft accepts, what a row costs. */
+        if (lookup_ix) {
+            /* Steps up to the first rejection were tested; later ones were not. */
+            for (uint32_t i = 0; i < k && i <= matched; i++) {
+                float *acc = &lookup_ix->cal_acc[lookup_level[i]][lookup_bin[i]];
+                float *tried = &lookup_ix->cal_try[lookup_level[i]][lookup_bin[i]];
+                *acc = 0.995f * *acc + (i < matched ? 1.0f : 0.0f);
+                *tried = 0.995f * *tried + 1.0f;
+            }
+            lookup_ix->skipped = 0;
+        } else {
+            d->lk_acc[lookup_bucket] = 0.97f * d->lk_acc[lookup_bucket] + (float)matched;
+            d->lk_drafted[lookup_bucket] = 0.97f * d->lk_drafted[lookup_bucket] + (float)k;
+            d->lk_skipped[lookup_bucket] = 0;
+        }
+        const float cycle_ms = (float)((now_sec() - t_cycle) * 1000.0);
+        float row_ms = (cycle_ms - 0.85f * d->lk_plain_ms) / (float)n;
+        if (row_ms < 5.0f) row_ms = 5.0f;
+        if (row_ms < 200.0f) d->lk_row_ms = 0.9f * d->lk_row_ms + 0.1f * row_ms;
+        d->lk_stat_cycles++;
+        d->lk_stat_drafted += k;
+        d->lk_stat_accepted += matched;
+        if ((d->lk_stat_cycles & 127u) == 0u)
+            fprintf(stderr, "ds4: V4.1 lookup cycles=%llu drafted=%llu accepted=%llu (%.0f%%) "
+                    "skipped=%llu step=%.1f ms row=%.1f ms\n",
+                    (unsigned long long)d->lk_stat_cycles,
+                    (unsigned long long)d->lk_stat_drafted,
+                    (unsigned long long)d->lk_stat_accepted,
+                    100.0 * (double)d->lk_stat_accepted / (double)d->lk_stat_drafted,
+                    (unsigned long long)d->lk_stat_skipped,
+                    (double)d->lk_plain_ms, (double)d->lk_row_ms);
     }
     if (lookup_only) {
         g->draft = NULL;
-        /* A five-token draft pays for itself from about two accepted tokens. */
-        d->policy_cycles++;
-        d->policy_accepted += matched;
-        d->policy_drafted += k;
-        if (d->policy_cycles >= 8u) {
-            /* Back off only from clearly unproductive stretches (under one
-             * accepted token in five drafted): on recorded agent sessions a
-             * stricter rule gave up gains made right after a bad stretch. */
-            if (5u * d->policy_accepted < d->policy_drafted) {
-                d->lk_streak = 0;
-                d->skip_left = 32u;
-                d->lk_valid = false;
-            }
-            d->policy_cycles = d->policy_accepted = d->policy_drafted = 0;
-        }
     }
     if (tp_verify) {
         const int32_t mode = ok && matched + 1u == n ?
