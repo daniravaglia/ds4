@@ -41609,6 +41609,7 @@ static bool ds41_stream_selected_begin(ds41_gpu_graph *g, const ds4_model *m,
 }
 #endif
 
+static bool ds41_five_experts(ds4_gpu_tensor *weights, uint32_t rows);
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -41631,7 +41632,8 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
                 m->map, m->size, bias->abs_offset, 0, 0, token,
                 DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
-                g->route_logits);
+                g->route_logits) &&
+            ds41_five_experts(g->route_weights, 1u);
     }
     if (profile) ok = ds41_decode_stage_profile_mark("moe_route", il, start, ok);
     if (!ok) return false;
@@ -42541,8 +42543,30 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
 }
 #endif
 
+/* DS4_V41_EXPERTS=5 (experiment, changes output): see ds4_gpu_dsv41_drop_last_route. */
+static bool ds41_five_experts(ds4_gpu_tensor *weights, uint32_t rows) {
+#ifdef DS4_ROCM_BUILD
+    static int five = -1;
+    if (five < 0) {
+        const char *v = getenv("DS4_V41_EXPERTS");
+        five = v && v[0] == '5';
+        if (five) fprintf(stderr, "ds4: V4.1 EXPERIMENT: five routed experts instead of six\n");
+    }
+    return !five || ds4_gpu_dsv41_drop_last_route(weights, rows) != 0;
+#else
+    (void)weights; (void)rows;
+    return true;
+#endif
+}
+static bool ds41_route_batch_six(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t count);
 static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_layer_weights *l, uint32_t count) {
+    return ds41_route_batch_six(g, m, l, count) &&
+        ds41_five_experts(g->batch.route_weights, count);
+}
+static bool ds41_route_batch_six(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
     if (!g->image_count) return ds4_gpu_router_select_batch_tensor(
         b->selected, b->route_weights, b->route_probs, m->map, m->size,
@@ -88924,6 +88948,18 @@ static uint32_t ds41_lk_pick(ds41_draft *d, struct ds41_lk_index *ix, const floa
     return pick;
 }
 
+/* Sessions that contain images: every verified row is a text position after
+ * the images, the case the short-prefill batches already serve.
+ * DS4_V41_LOOKUP_IMAGES=0 keeps lookup off there. */
+static bool ds41_lookup_with_images(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_V41_LOOKUP_IMAGES");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+}
+
 /* How many lookup tokens to verify, or 0 for none.
  *
  * A verify of w drafts costs about one step plus w + 1 rows, and each row
@@ -89083,7 +89119,8 @@ static int ds41_session_spec(ds4_session *s, int first_token,
     uint8_t lookup_level[DS4_DSPARK_MAX_BLOCK_SIZE], lookup_bin[DS4_DSPARK_MAX_BLOCK_SIZE];
     float lookup_expect[DS4_DSPARK_MAX_BLOCK_SIZE];
     if (lookup_min > 0 && s->lookup_allowed && (!lookup_only || !d->skip_left) &&
-        !tp_verify && !g->image_count && pos + B < g->ctx && max_tokens > 1 && accepted_cap > 1)
+        !tp_verify && (!g->image_count || ds41_lookup_with_images()) &&
+        pos + B < g->ctx && max_tokens > 1 && accepted_cap > 1)
     {
         uint32_t width = B;
         if ((uint32_t)lookup_k < width) width = (uint32_t)lookup_k;

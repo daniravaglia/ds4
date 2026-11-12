@@ -2793,6 +2793,7 @@ int ds4_gpu_dsv41_hc_mix_side(ds4_gpu_tensor *split_out, ds4_gpu_tensor *mix,
         uint64_t scale_offset, uint64_t base_offset, uint32_t sinkhorn_iters,
         float hc_eps, float rms_eps);
 int ds4_gpu_dsv41_hc_mix_side_join(void);
+int ds4_gpu_dsv41_drop_last_route(ds4_gpu_tensor *weights, uint32_t rows);
 #elif !defined(__APPLE__)
 int ds4_gpu_device_is_spark(void);
 #endif
