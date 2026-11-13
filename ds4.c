@@ -44266,8 +44266,13 @@ static void ds41_stream_predict_launch(const ds4_model *m, const ds4_layer_weigh
     /* Measured 2026-11-11 (A/B/B/A, identical logits): one vote is best from
      * 1024 rows (+1024 tokens 5.93 -> 5.61 s, +2048 9.95 -> 8.19 s), two votes
      * for 512-1023 rows (+712 tokens 5.17 -> 4.89 s). Below 512 rows the
-     * prediction does not pay (see ds41_stage_predict_min_rows). */
-    const int votes = votes_env ? votes_env : (n >= 1024u * DS4_N_EXPERT_USED ? 1 : 2);
+     * prediction does not pay (see ds41_stage_predict_min_rows).
+     * Re-measured 2026-11-13 with a content shift (prose then code) as well as
+     * the warm novel, 3 A/B pairs each: 1024-2047 rows want three votes
+     * (+1024 tokens shift 7.73 -> 7.12 s, warm 5.12 -> 4.96 s); at 712 and 2048
+     * rows the two workloads disagree by 2-3 %, so those keep two and one. */
+    const int votes = votes_env ? votes_env :
+        (n >= 2048u * DS4_N_EXPERT_USED ? 1 : n >= 1024u * DS4_N_EXPERT_USED ? 3 : 2);
     {
         uint32_t kept = 0;
         if (g_ds41_pred.ids_cap < 384u) return;
