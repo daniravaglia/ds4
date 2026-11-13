@@ -1544,6 +1544,154 @@ __global__ static void v41_hc_ordered_prefetch_kernel(float *out,
     }
 }
 
+/* Engram projection (F16 6144 -> 25600) from an exact E4M3 copy.
+ *
+ * Every 32x32 block of the two Engram projection matrices is an E4M3 value
+ * times a power of two (they were FP8 before the GGUF upcast), checked at
+ * build time block by block. The copy holds one byte per weight plus one
+ * exponent per block, so a decode token reads 2 x 157 MB instead of
+ * 2 x 315 MB. The kernel keeps the shared-X single-row kernel's lane order
+ * (lane l: elements l + 32 j, eight per 256-wide step, then the warp sum)
+ * and widens each byte to the same float the F16 weight gives, so results
+ * are bit-identical (checked against the F16 kernel on both matrices). Single
+ * rows only: at 4-6 rows the F16 tile kernel is faster. DS4_ROCM_V41_ENGRAM_E4M3=0
+ * disables. */
+__device__ static inline float v41_e4m3_decode(uint32_t b) {
+    const int e = (int)((b >> 3) & 15u), m = (int)(b & 7u);
+    const float v = e ? ldexpf((float)(8 + m), e - 10) : ldexpf((float)m, -9);
+    return (b & 128u) ? -v : v;
+}
+/* Branch-light widening: normal codes map to float bits directly, the
+ * seven subnormal codes (and zero) are m * 2^-9. Same values as the table. */
+__device__ static inline float v41_e4m3_bits(uint32_t b) {
+    const uint32_t e = (b >> 3) & 15u, m = b & 7u;
+    const float normal = __uint_as_float(((b & 128u) << 24) | ((e + 120u) << 23) | (m << 20));
+    const float sub = __uint_as_float((b & 128u) << 24 | 0x3b000000u) * (float)m; /* +-2^-9 * m */
+    return e ? normal : sub;
+}
+/* One 32x32 block per 256-thread workgroup. */
+__global__ static void v41_engram_e4m3_build_kernel(uint8_t *q, int8_t *exps,
+        const __half *w, uint32_t *inexact) {
+    constexpr uint32_t K = 6144u;
+    const uint32_t bc = blockIdx.x, br = blockIdx.y, tid = threadIdx.x;
+    __shared__ float smax[256];
+    float vals[4];
+    float mx = 0.0f;
+#pragma unroll
+    for (uint32_t u = 0; u < 4u; u++) {
+        const uint32_t idx = tid + u * 256u, r = idx >> 5, c = idx & 31u;
+        vals[u] = __half2float(w[(uint64_t)(br * 32u + r) * K + bc * 32u + c]);
+        mx = fmaxf(mx, fabsf(vals[u]));
+    }
+    smax[tid] = mx;
+    __syncthreads();
+    for (uint32_t st = 128u; st; st >>= 1) {
+        if (tid < st) smax[tid] = fmaxf(smax[tid], smax[tid + st]);
+        __syncthreads();
+    }
+    mx = smax[0];
+    int se = 0;
+    if (mx > 0.0f) {
+        int e2; (void)frexpf(mx / 448.0f, &e2);   /* mx/448 = f * 2^e2, f in [0.5, 1) */
+        se = e2;                                   /* 2^se >= mx/448 */
+        if (ldexpf(1.0f, se - 1) >= mx / 448.0f) se--;
+    }
+    if (tid == 0) exps[br * (K / 32u) + bc] = (int8_t)se;
+    if (se < -120 || se > 120) { atomicOr(inexact, 1u); return; }
+#pragma unroll
+    for (uint32_t u = 0; u < 4u; u++) {
+        const uint32_t idx = tid + u * 256u, r = idx >> 5, c = idx & 31u;
+        const float v = ldexpf(vals[u], -se), a = fabsf(v);
+        uint32_t b = 0;
+        if (a != 0.0f) {
+            int e2; const float f = frexpf(a, &e2);      /* a = f * 2^e2 */
+            const int be = e2 - 1 + 7;
+            if (be >= 1) {
+                const float mant = (2.0f * f - 1.0f) * 8.0f;
+                b = ((uint32_t)be << 3) | (uint32_t)fminf(fmaxf(mant, 0.0f), 7.0f);
+                if (be > 15) b = 0x7fu;
+            } else {
+                b = (uint32_t)fminf(a * 512.0f, 7.0f);
+            }
+        }
+        if (signbit(v)) b |= 128u;
+        if (v41_e4m3_decode(b) != v || (b & 0x7fu) == 0x7fu) atomicOr(inexact, 1u);
+        q[(uint64_t)(br * 32u + r) * K + bc * 32u + c] = (uint8_t)b;
+    }
+}
+struct v41_engram_e4m3 { const uint8_t *q; const int8_t *exps; };
+static v41_engram_e4m3 v41_engram_e4m3_weights(const void *model_map, uint64_t weight_offset,
+                                                const __half *w) {
+    struct entry { const void *map; uint64_t offset; uint8_t *q; int8_t *e; int state; };
+    static entry cache[4];
+    for (uint32_t i = 0; i < 4u; i++) {
+        entry *c = &cache[i];
+        if (c->state && c->map == model_map && c->offset == weight_offset)
+            return c->state == 1 ? v41_engram_e4m3{c->q, c->e} : v41_engram_e4m3{NULL, NULL};
+        if (c->state) continue;
+        c->map = model_map; c->offset = weight_offset; c->state = 2;
+        const uint64_t n = 6144ull * 25600ull, nb = (6144ull / 32u) * (25600ull / 32u);
+        uint32_t *flag = NULL, inexact = 0;
+        if (!cuda_ok(cudaMalloc(&c->q, n), "V4.1 Engram E4M3 weights") ||
+            !cuda_ok(cudaMalloc(&c->e, nb), "V4.1 Engram E4M3 exponents") ||
+            !cuda_ok(cudaMalloc(&flag, sizeof(uint32_t)), "V4.1 Engram E4M3 check") ||
+            !cuda_ok(cudaMemcpy(flag, &inexact, sizeof(inexact), cudaMemcpyHostToDevice), "V4.1 Engram E4M3 reset")) {
+            (void)cudaGetLastError();
+        } else {
+            v41_engram_e4m3_build_kernel<<<dim3(6144u / 32u, 25600u / 32u), 256u>>>(c->q, c->e, w, flag);
+            if (cuda_ok(cudaGetLastError(), "V4.1 Engram E4M3 build") &&
+                cuda_ok(cudaMemcpy(&inexact, flag, sizeof(inexact), cudaMemcpyDeviceToHost), "V4.1 Engram E4M3 read") &&
+                !inexact) c->state = 1;
+        }
+        if (flag) (void)cudaFree(flag);
+        if (c->state != 1) {
+            if (c->q) (void)cudaFree(c->q);
+            if (c->e) (void)cudaFree(c->e);
+            c->q = NULL; c->e = NULL;
+            fprintf(stderr, "ds4: V4.1 Engram weights at %llu are not exact E4M3 blocks; keeping F16\n",
+                    (unsigned long long)weight_offset);
+            return v41_engram_e4m3{NULL, NULL};
+        }
+        fprintf(stderr, "ds4: V4.1 Engram projection reads an exact E4M3 copy (%.0f MB)\n",
+                (double)(n + nb) / 1e6);
+        return v41_engram_e4m3{c->q, c->e};
+    }
+    return v41_engram_e4m3{NULL, NULL};
+}
+/* Same lane order and FMA chain as matmul_f16_f32_sharedx_warp_rows_w32_kernel. */
+__global__ static void __launch_bounds__(1024) v41_engram_e4m3_row_kernel(float *out,
+        const uint8_t *q, const int8_t *exps, const float *x) {
+    constexpr uint32_t K = 6144u;
+    extern __shared__ float shx[];
+    __shared__ float scale[K / 32u];
+    const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5u;
+    for (uint32_t i = tid; i < K; i += 1024u) shx[i] = x[i];
+    /* All 32 rows of this workgroup lie in one 32-row block. */
+    if (tid < K / 32u) scale[tid] = ldexpf(1.0f, exps[blockIdx.x * (K / 32u) + tid]);
+    __syncthreads();
+    const uint64_t row = (uint64_t)blockIdx.x * 32u + wave;
+    const uint8_t *wr = q + row * K;
+    float acc = 0.0f;
+    for (uint32_t i = lane; i + 224u < K; i += 256u) {
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            const uint32_t k = i + 32u * j;
+            const float wv = __fmul_rn(v41_e4m3_bits(wr[k]), scale[k >> 5]);
+            acc = __fmaf_rn(wv, shx[k], acc);   /* the F16 kernel's contracted FMA */
+        }
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+static bool v41_engram_e4m3_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_ENGRAM_E4M3");
+        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
+    }
+    return on != 0;
+}
+
 /* Rows the tiny-row kernels serve: six for prefill batches, sixteen while a
  * speculative verify runs (prefill tail chunks of 7-16 rows keep their
  * established kernels, so prefill results do not change). */
@@ -1558,6 +1706,18 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
         !cuda_u64_mul3_checked(width, outputs, sizeof(uint16_t), &weight_bytes) ||
         !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
         !cuda_tensor_has_elems2(in, width, rows, 4u) || !cuda_tensor_has_elems2(out, outputs, rows, 4u)) return 0;
+    if (width == 6144u && outputs == 25600u && rows == 1u && v41_engram_e4m3_on() &&
+        !g_quality_mode && !cuda_runtime_config()->graph_dump) {
+        const __half *w = (const __half *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes, "V4.1 exact Engram F16");
+        if (!w) return 0;
+        const v41_engram_e4m3 e4 = v41_engram_e4m3_weights(model_map, weight_offset, w);
+        if (e4.q) {
+            v41_engram_e4m3_row_kernel<<<25600u / 32u, 1024u, 6144u * sizeof(float)>>>(
+                (float *)out->ptr, e4.q, e4.exps, (const float *)in->ptr);
+            return cuda_ok(cudaGetLastError(), "V4.1 Engram E4M3 projection");
+        }
+    }
     if (width == 6144u && outputs == 25600u && rows >= 2u && rows <= 6u &&
         ds4_rocm_is_gfx1151() && !cuda_runtime_config()->graph_dump) {
         const __half *w = (const __half *)cuda_model_range_ptr(
