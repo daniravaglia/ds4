@@ -44135,7 +44135,7 @@ static bool ds41_selective_sweep_enabled(const ds41_gpu_graph *g, uint32_t total
  * (ds4_gpu_dsv41_stream_prepare_layer_topup). A wrong prediction costs reads,
  * never results: the routed kernels only touch really selected experts.
  * DS4_ROCM_V41_STAGE_PREDICT=0 disables; DS4_ROCM_V41_STAGE_PREDICT_MIN_ROWS
- * (default 512) and DS4_ROCM_V41_STAGE_PREDICT_MIN_VOTES override the policy. */
+ * (default 256) and DS4_ROCM_V41_STAGE_PREDICT_MIN_VOTES override the policy. */
 static struct {
     ds41_stream_layer_load job;
     ds4_gpu_dsv41_stream_layer_plan plan; /* loaded plan of a joined prefetch */
@@ -44171,7 +44171,10 @@ static uint32_t ds41_stage_predict_min_rows(void) {
     static int rows = -1;
     if (rows < 0) {
         const char *v = getenv("DS4_ROCM_V41_STAGE_PREDICT_MIN_ROWS");
-        rows = v && v[0] ? atoi(v) : 512;
+        /* 256 since 2026-11-13: with four votes below 512 rows a content
+         * shift append of 256-384 tokens runs 10-12 % faster and warm text is
+         * unchanged; 128 rows still lost 2-3 % on warm text. */
+        rows = v && v[0] ? atoi(v) : 256;
         if (rows < 1) rows = 1;
     }
     return (uint32_t)rows;
@@ -44272,7 +44275,8 @@ static void ds41_stream_predict_launch(const ds4_model *m, const ds4_layer_weigh
      * (+1024 tokens shift 7.73 -> 7.12 s, warm 5.12 -> 4.96 s); at 712 and 2048
      * rows the two workloads disagree by 2-3 %, so those keep two and one. */
     const int votes = votes_env ? votes_env :
-        (n >= 2048u * DS4_N_EXPERT_USED ? 1 : n >= 1024u * DS4_N_EXPERT_USED ? 3 : 2);
+        (n >= 2048u * DS4_N_EXPERT_USED ? 1 : n >= 1024u * DS4_N_EXPERT_USED ? 3 :
+         n >= 512u * DS4_N_EXPERT_USED ? 2 : 4);
     {
         uint32_t kept = 0;
         if (g_ds41_pred.ids_cap < 384u) return;
