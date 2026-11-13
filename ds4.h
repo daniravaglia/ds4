@@ -475,6 +475,10 @@ size_t ds4_session_image_token_ranges(const ds4_session *s, uint32_t *starts,
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+size_t ds4_session_vision_identities(const ds4_session *s, uint32_t *starts,
+                                     uint32_t *counts, uint8_t (*fps)[32], size_t cap);
+bool ds4_session_adopt_vision_identities(ds4_session *s, const ds4_vision_span *spans,
+                                         size_t n);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,

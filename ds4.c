@@ -79473,6 +79473,42 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
     return true;
 }
 
+/* Image identities of the committed checkpoint, in token order. Returns
+ * SIZE_MAX while a multimodal sync is in progress (identities not final). */
+size_t ds4_session_vision_identities(const ds4_session *s, uint32_t *starts,
+                                     uint32_t *counts, uint8_t (*fps)[32], size_t cap) {
+    if (!s || !s->checkpoint_valid) return 0;
+    if (s->sync_image_count != 0) return SIZE_MAX;
+    for (size_t i = 0; i < s->checkpoint_image_count && i < cap; i++) {
+        if (starts) starts[i] = s->checkpoint_images[i].token_start;
+        if (counts) counts[i] = s->checkpoint_images[i].token_count;
+        if (fps) memcpy(fps[i], s->checkpoint_images[i].fingerprint, 32);
+    }
+    return s->checkpoint_image_count;
+}
+
+/* After restoring a disk checkpoint whose key carried image fingerprints,
+ * record which of the request's images lie inside the restored prefix. */
+bool ds4_session_adopt_vision_identities(ds4_session *s, const ds4_vision_span *spans,
+                                         size_t n) {
+    if (!s || !s->checkpoint_valid || (n && !spans)) return false;
+    size_t keep = 0;
+    while (keep < n && (uint64_t)spans[keep].token_start +
+           spans[keep].embedding.token_count <= (uint64_t)s->checkpoint.len) keep++;
+    if (keep < n && spans[keep].token_start < (uint32_t)s->checkpoint.len) return false;
+    ds4_vision_identity *copy = keep ? calloc(keep, sizeof(*copy)) : NULL;
+    if (keep && !copy) return false;
+    for (size_t i = 0; i < keep; i++) {
+        copy[i].token_start = spans[i].token_start;
+        copy[i].token_count = spans[i].embedding.token_count;
+        memcpy(copy[i].fingerprint, spans[i].embedding.fingerprint, sizeof(copy[i].fingerprint));
+    }
+    free(s->checkpoint_images);
+    s->checkpoint_images = copy;
+    s->checkpoint_image_count = keep;
+    return true;
+}
+
 bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
 }

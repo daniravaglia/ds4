@@ -187,6 +187,7 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
 const char *ds4_kvstore_key_kind(uint8_t ext_flags) {
     if (ext_flags & DS4_KVSTORE_EXT_RESPONSES_VISIBLE) return "responses-visible";
     if (ext_flags & DS4_KVSTORE_EXT_THINKING_VISIBLE) return "thinking-visible";
+    if (ext_flags & DS4_KVSTORE_EXT_VISION_KEY) return "token-text-images";
     return "token-text";
 }
 
@@ -678,6 +679,48 @@ char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
         char *piece = ds4_token_text(engine, tokens->v[i], &len);
         kv_buf_append(&b, piece, len);
         free(piece);
+    }
+    if (out_len) *out_len = b.len;
+    return kv_buf_take(&b);
+}
+
+char *ds4_kvstore_render_vision_key(ds4_engine *engine, const ds4_tokens *tokens, int len,
+                                    const uint32_t *starts, const uint32_t *counts,
+                                    const uint8_t (*fps)[32], size_t n, size_t *out_len) {
+    if (!tokens || len < 0 || len > tokens->len || (n && (!starts || !counts || !fps)))
+        return NULL;
+    static const char hex[] = "0123456789abcdef";
+    kv_buf b = {0};
+    size_t img = 0;
+    for (int i = 0; i < len;) {
+        if (img < n && (uint32_t)i == starts[img]) {
+            if ((uint64_t)starts[img] + counts[img] > (uint64_t)len) {
+                free(kv_buf_take(&b));
+                return NULL;
+            }
+            char mark[96];
+            size_t m = 0;
+            mark[m++] = '\036';
+            mark[m++] = 'I'; mark[m++] = 'M'; mark[m++] = 'G';
+            for (int k = 0; k < 32; k++) {
+                mark[m++] = hex[fps[img][k] >> 4];
+                mark[m++] = hex[fps[img][k] & 15];
+            }
+            m += (size_t)snprintf(mark + m, sizeof(mark) - m, ":%u\037", counts[img]);
+            kv_buf_append(&b, mark, m);
+            i += (int)counts[img];
+            img++;
+            continue;
+        }
+        if (img < n && (uint32_t)i > starts[img]) {   /* unsorted or overlapping spans */
+            free(kv_buf_take(&b));
+            return NULL;
+        }
+        size_t plen = 0;
+        char *piece = ds4_token_text(engine, tokens->v[i], &plen);
+        kv_buf_append(&b, piece, plen);
+        free(piece);
+        i++;
     }
     if (out_len) *out_len = b.len;
     return kv_buf_take(&b);

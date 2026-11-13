@@ -11265,6 +11265,52 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
     };
 }
 
+#define KV_EXT_VISION_KEY DS4_KVSTORE_EXT_VISION_KEY
+enum { KV_VISION_KEY_MAX_IMAGES = 64 };
+
+/* DS4_SERVER_IMAGE_DISK_KV=0 restores "no disk checkpoints for sessions
+ * with images". */
+static bool server_image_disk_kv_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_SERVER_IMAGE_DISK_KV");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+}
+
+/* Key text for the live session's first store_len tokens with its images'
+ * fingerprints; NULL while a multimodal sync is running or if an image
+ * straddles store_len (caller holds inference_mu). */
+static char *kv_vision_key_session(server *s, server_slot *slot,
+                                   const ds4_tokens *tokens, int store_len) {
+    uint32_t starts[KV_VISION_KEY_MAX_IMAGES], counts[KV_VISION_KEY_MAX_IMAGES];
+    uint8_t fps[KV_VISION_KEY_MAX_IMAGES][32];
+    const size_t n = ds4_session_vision_identities(slot->session, starts, counts, fps,
+                                                   KV_VISION_KEY_MAX_IMAGES);
+    if (n == SIZE_MAX || n > KV_VISION_KEY_MAX_IMAGES) return NULL;
+    size_t use = 0;
+    while (use < n && starts[use] < (uint32_t)store_len) use++;
+    return ds4_kvstore_render_vision_key(s->engine, tokens, store_len,
+                                         starts, counts, (const uint8_t (*)[32])fps,
+                                         use, NULL);
+}
+
+/* The same key for a request's whole prompt. */
+static char *kv_vision_key_request(server *s, const request *req) {
+    if (!req || !req->image_count || req->image_count > KV_VISION_KEY_MAX_IMAGES) return NULL;
+    uint32_t starts[KV_VISION_KEY_MAX_IMAGES], counts[KV_VISION_KEY_MAX_IMAGES];
+    uint8_t fps[KV_VISION_KEY_MAX_IMAGES][32];
+    for (size_t i = 0; i < req->image_count; i++) {
+        starts[i] = req->images[i].token_start;
+        counts[i] = req->images[i].embedding.token_count;
+        memcpy(fps[i], req->images[i].embedding.fingerprint, 32);
+    }
+    return ds4_kvstore_render_vision_key(s->engine, &req->prompt, req->prompt.len,
+                                         starts, counts, (const uint8_t (*)[32])fps,
+                                         req->image_count, NULL);
+}
+
 static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const ds4_tokens *tokens,
                                             int store_len, const char *reason,
@@ -11280,9 +11326,20 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
      * placeholder tokens become a cache hit for a different image.
      * sync_image_count covers progress-callback writes during prefill;
      * checkpoint_image_count covers completed sessions. */
+    char *vision_key = NULL;
     if (ds4_session_has_vision_state(slot->session)) {
-        pthread_mutex_unlock(&s->inference_mu);
-        return false;
+        /* Image sessions are stored under a key that carries every image's
+         * fingerprint (kv_vision_key_session); visible-text keys and stores
+         * during a multimodal prefill stay refused. */
+        if (!cache_text_override && server_image_disk_kv_on())
+            vision_key = kv_vision_key_session(s, slot, tokens, store_len);
+        if (!vision_key) {
+            pthread_mutex_unlock(&s->inference_mu);
+            return false;
+        }
+        cache_text_override = vision_key;
+        cache_text_ext = KV_EXT_VISION_KEY;
+        cache_text_key = "token-text-images";
     }
     pthread_mutex_lock(&s->kv_mu);
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
@@ -11294,6 +11351,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   &hooks, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
+    free(vision_key);
     return ok;
 }
 
@@ -13725,12 +13783,53 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    if (!multimodal && s->kv.enabled && cached == 0 &&
+    bool evict_stored = false;
+    if ((!multimodal || server_image_disk_kv_on()) && s->kv.enabled && cached == 0 &&
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, slot, "evict");
+        evict_stored = true;
+    }
+    /* Image sessions: look up the longest checkpoint whose key (tokens plus
+     * image fingerprints) is a prefix of this request's key. The restored
+     * tokens must be an exact prefix of the request and no image may cross
+     * the restore point; the restored images are then adopted as the
+     * session's vision state. */
+    if (multimodal && cached == 0 && s->kv.enabled && !responses_protocol &&
+        server_image_disk_kv_on()) {
+        char *key = kv_vision_key_request(s, &j->req);
+        if (key) {
+            ds4_tokens scratch = {0};
+            uint8_t ext = 0;
+            int loaded = kv_cache_try_load_text(s, slot, key, &scratch,
+                                                &disk_cache_path, &ext, false);
+            ds4_tokens_free(&scratch);
+            free(key);
+            if (loaded > 0) {
+                pthread_mutex_lock(&s->inference_mu);
+                const int pos = ds4_session_pos(slot->session);
+                const bool usable =
+                    pos > 0 && pos < j->req.prompt.len &&
+                    ds4_session_common_prefix(slot->session, &j->req.prompt) == pos &&
+                    ds4_session_adopt_vision_identities(slot->session, j->req.images,
+                                                        j->req.image_count);
+                if (!usable) ds4_session_invalidate(slot->session);
+                pthread_mutex_unlock(&s->inference_mu);
+                if (usable) {
+                    cached = disk_cached = pos;
+                    cache_source = "disk-image-key";
+                } else {
+                    free(disk_cache_path);
+                    disk_cache_path = NULL;
+                }
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: multimodal image checkpoint %s tokens=%d images=%zu prompt=%d",
+                           usable ? "restored" : "rejected (token or image mismatch)",
+                           pos, j->req.image_count, j->req.prompt.len);
+            }
+        }
     }
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
@@ -13755,7 +13854,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     {
         const char *marker = strstr(j->req.prompt_text, j->req.image_markers[0]);
         if (marker) {
-            if (old_pos >= s->kv.opt.min_tokens)
+            if (!evict_stored && old_pos >= s->kv.opt.min_tokens)
                 kv_cache_store_current(s, slot, "evict");
             char *text_prefix = xstrndup(j->req.prompt_text,
                                          (size_t)(marker - j->req.prompt_text));
@@ -13987,7 +14086,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    if (!multimodal || server_image_disk_kv_on()) kv_cache_maybe_store_continued(s, slot);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -14126,7 +14225,7 @@ decode_again:
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+            if (!multimodal || server_image_disk_kv_on()) kv_cache_maybe_store_continued(s, slot);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
