@@ -13546,6 +13546,17 @@ static bool server_image_prefix_kv_on(void) {
     return on != 0;
 }
 
+/* Anchor checkpoints for cold prompts longer than cold_max (default on;
+ * DS4_SERVER_LONG_COLD_ANCHOR=0 restores the old limit). */
+static bool server_long_cold_anchor_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_SERVER_LONG_COLD_ANCHOR");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+}
+
 /* V4.1 in-memory snapshot rewind on live-cache divergence (default on;
  * DS4_SERVER_SNAPSHOT_REWIND=0 restores the full rebuild). */
 static bool server_snapshot_rewind_on(void) {
@@ -13975,14 +13986,20 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!multimodal && cached == 0 &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0 &&
-        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
+        s->kv.opt.cold_max_tokens > 0)
     {
+        /* Long cold prompts (OMP compaction summaries are 40-70K tokens) still
+         * store their stable chat prefix when that prefix fits cold_max:
+         * consecutive compactions share their first 4-5K tokens. */
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
                                                     ds4_token_user(s->engine),
                                                     ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        if (prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
+            cold_store_len = anchor >= s->kv.opt.min_tokens ?
+                             anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        else if (anchor >= s->kv.opt.min_tokens && anchor <= s->kv.opt.cold_max_tokens &&
+                 server_long_cold_anchor_on())
+            cold_store_len = anchor;
     }
     if (multimodal && cached == 0 && s->kv.enabled && !responses_protocol &&
         j->req.images && server_image_prefix_kv_on() &&
