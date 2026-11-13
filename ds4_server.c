@@ -11621,6 +11621,7 @@ static bool live_text_prefix_offset(const request *req, const char *ptext, size_
 
 static int live_prefix_rewind_target(bool backend_can_rewind,
                                      int old_pos, int prompt_len, int common);
+static bool server_snapshot_rewind_on(void);
 
 typedef enum {
     REUSE_NONE = 0,
@@ -11730,6 +11731,20 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         pr.kind = REUSE_MEMORY_REWIND;
         pr.reuse_tokens = rewind_to;
         return pr;
+    }
+    /* V4.1 keeps in-memory snapshots of its small attention state. When the
+     * prompt leaves the live session (re-rendered last turn, thinking flip,
+     * rewritten tool call), continue from the nearest snapshot at or before
+     * the common prefix instead of rebuilding everything. Image identity is
+     * re-checked after the rewind. */
+    if (common < live_pos && server_snapshot_rewind_on()) {
+        const int limit = common < req->prompt.len ? common : req->prompt.len - 1;
+        const int point = limit > 0 ? ds4_session_rewind_point(slot->session, limit) : -1;
+        if (point > 0) {
+            pr.kind = REUSE_MEMORY_REWIND;
+            pr.reuse_tokens = point;
+            return pr;
+        }
     }
     if (common == live_pos && req->prompt.len >= live_pos && token_image_prefix) {
         pr.kind = REUSE_MEMORY_TOKEN;
@@ -13473,6 +13488,17 @@ static bool server_image_prefix_kv_on(void) {
     return on != 0;
 }
 
+/* V4.1 in-memory snapshot rewind on live-cache divergence (default on;
+ * DS4_SERVER_SNAPSHOT_REWIND=0 restores the full rebuild). */
+static bool server_snapshot_rewind_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_SERVER_SNAPSHOT_REWIND");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -13604,25 +13630,37 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * and the vision state must still describe the request (upstream's
          * multimodal hardening).  A failed validation falls through to the
          * disk cache / cold prefill instead of reusing a bad frontier. */
+        const bool snapshot_rewind = ds4_engine_is_deepseek41(s->engine);
         const bool rewind_valid =
+            ds4_session_checkpoint_valid(slot->session) &&
             ds4_session_common_prefix(slot->session, &j->req.prompt) ==
                 reuse.reuse_tokens &&
             (!multimodal ||
-             ds4_session_vision_state_matches(slot->session,
-                                              j->req.images,
-                                              j->req.image_count));
+             (snapshot_rewind ?
+              ds4_session_vision_prefix_matches(slot->session,
+                                                j->req.images,
+                                                j->req.image_count) :
+              ds4_session_vision_state_matches(slot->session,
+                                               j->req.images,
+                                               j->req.image_count)));
         pthread_mutex_unlock(&s->inference_mu);
         if (rewind_valid) {
             live_materialized = true;
             cache_source = "memory-rewind";
             cache_diag.rewind_to = reuse.reuse_tokens;
-            server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                       old_pos, reuse.reuse_tokens);
+            if (snapshot_rewind)
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: live snapshot rewind from %d to %d (common=%d prompt=%d), replaying %d tokens",
+                           old_pos, reuse.reuse_tokens, common, j->req.prompt.len,
+                           j->req.prompt.len - reuse.reuse_tokens);
+            else
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
+                           old_pos, reuse.reuse_tokens);
         } else {
             cached = 0;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
+                       "ds4-server: live prefix rewind from %d to %d requires rebuild",
                        old_pos, reuse.reuse_tokens);
         }
         break;

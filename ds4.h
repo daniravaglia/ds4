@@ -595,6 +595,9 @@ void ds4_session_invalidate(ds4_session *s);
  * the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
+/* Largest in-memory rewind point <= max_pos that ds4_session_rewind() can
+ * restore without a rebuild (V4.1 snapshots), or -1. */
+int ds4_session_rewind_point(ds4_session *s, int max_pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);

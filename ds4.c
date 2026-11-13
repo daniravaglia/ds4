@@ -64031,6 +64031,17 @@ struct ds4_session {
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     ds41_gpu_graph ds41_graph;
     bool ds41_graph_ready;
+    /* In-memory rewind points (see ds41_snap_capture). */
+    struct ds41_snap {
+        uint32_t pos;
+        bool valid;
+        uint64_t token_hash;
+        ds4_engram_history history;
+        float *state;   /* 40 windows of 128 x 512, then 3 x (previous kv, score) */
+        float *logits;
+    } ds41_snaps[16];
+    uint32_t ds41_snap_next;
+    uint32_t ds41_snap_last_pos;
 #endif
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
@@ -66255,6 +66266,8 @@ static bool ds41_payload_header_valid(ds4_session *s, const uint32_t *h,
         h[12] == 0x413431u && remaining == ds41_payload_body_bytes(g, pos);
 }
 
+static void ds41_snaps_clear(ds4_session *s);
+
 static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
                               uint64_t remaining, char *err, size_t errlen) {
     ds41_gpu_graph *g = &s->ds41_graph;
@@ -66278,6 +66291,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
     if (!rc) {
         s->checkpoint_valid = false;
         g->valid = false;
+        ds41_snaps_clear(s);
         rc = payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * 4u, &remaining, err, errlen);
         ds41_state_span spans[54];
         const uint32_t n = ds41_state_spans(g, pos, spans);
@@ -66309,6 +66323,148 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
     }
     ds4_tokens_free(&tokens);
     return rc;
+}
+
+/* In-memory rewind points for V4.1.
+ *
+ * The state at position P is the 40 sliding-window rings, the three
+ * unfinished compression pairs, the Engram n-gram history and the logits;
+ * every compressed/indexer cache row below P is append-only by position and
+ * stays valid while later tokens are added. So a ~10.5 MB copy taken at P
+ * lets a session whose next prompt diverges after P continue from P instead
+ * of re-prefilling everything (clients re-render their last turn, thinking
+ * flips, rewritten tool calls). Snapshots are taken only at committed points
+ * (no verify pending), at most one per 256 tokens plus one at the end of
+ * every prompt, in a ring of 16. `DS4_V41_SNAPSHOTS=0` disables them. */
+enum { DS41_SNAP_COUNT = 16, DS41_SNAP_SPACING = 256 };
+#define DS41_SNAP_WINDOW_FLOATS (128u * 512u)
+#define DS41_SNAP_STATE_FLOATS (40u * DS41_SNAP_WINDOW_FLOATS + 3u * 2u * 512u)
+
+static bool ds41_snap_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_V41_SNAPSHOTS");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+}
+
+static uint64_t ds41_snap_hash(const ds4_session *s, uint32_t pos) {
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (uint32_t i = 0; i < pos; i++) {
+        h ^= (uint32_t)s->checkpoint.v[i];
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static void ds41_snaps_clear(ds4_session *s) {
+    for (uint32_t i = 0; i < DS41_SNAP_COUNT; i++) s->ds41_snaps[i].valid = false;
+    s->ds41_snap_last_pos = 0;
+}
+
+static void ds41_snaps_free(ds4_session *s) {
+    for (uint32_t i = 0; i < DS41_SNAP_COUNT; i++) {
+        free(s->ds41_snaps[i].state);
+        free(s->ds41_snaps[i].logits);
+        memset(&s->ds41_snaps[i], 0, sizeof(s->ds41_snaps[i]));
+    }
+    s->ds41_snap_last_pos = 0;
+}
+
+static void ds41_snap_capture(ds4_session *s, bool force) {
+    if (!s || !ds41_snap_enabled() || !s->ds41_graph_ready) return;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    const uint32_t pos = g->pos;
+    if (!g->valid || !s->checkpoint_valid || pos == 0 || pos != (uint32_t)s->checkpoint.len)
+        return;
+    if (pos < s->ds41_snap_last_pos) s->ds41_snap_last_pos = 0; /* moved back */
+    if (!force && s->ds41_snap_last_pos &&
+        pos < s->ds41_snap_last_pos + DS41_SNAP_SPACING) return;
+    for (uint32_t i = 0; i < DS41_SNAP_COUNT; i++)
+        if (s->ds41_snaps[i].valid && s->ds41_snaps[i].pos == pos) return;
+    struct ds41_snap *sn = &s->ds41_snaps[s->ds41_snap_next % DS41_SNAP_COUNT];
+    if (!sn->state) sn->state = malloc((size_t)DS41_SNAP_STATE_FLOATS * sizeof(float));
+    if (!sn->logits) sn->logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (!sn->state || !sn->logits) return;
+    sn->valid = false;
+    if (!ds4_gpu_synchronize()) return;
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < 40; il++)
+        ok = ds4_gpu_tensor_read(g->window[il], 0, sn->state + (size_t)il * DS41_SNAP_WINDOW_FLOATS,
+                                 (uint64_t)DS41_SNAP_WINDOW_FLOATS * 4u) != 0;
+    float *prev = sn->state + (size_t)40u * DS41_SNAP_WINDOW_FLOATS;
+    for (uint32_t i = 0; ok && i < 3; i++)
+        ok = ds4_gpu_tensor_read(g->previous_kv[i], 0, prev + i * 1024u, 512u * 4u) != 0 &&
+             ds4_gpu_tensor_read(g->previous_score[i], 0, prev + i * 1024u + 512u, 512u * 4u) != 0;
+    if (!ok) return;
+    memcpy(sn->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    sn->history = g->history;
+    sn->pos = pos;
+    sn->token_hash = ds41_snap_hash(s, pos);
+    sn->valid = true;
+    s->ds41_snap_next++;
+    s->ds41_snap_last_pos = pos;
+}
+
+/* Largest snapshot position <= max_pos whose tokens are still the session's
+ * prefix, or -1. */
+static int ds41_snap_best(ds4_session *s, int max_pos) {
+    if (!s || !ds41_snap_enabled() || !s->ds41_graph_ready || !s->checkpoint_valid) return -1;
+    int best = -1;
+    for (uint32_t i = 0; i < DS41_SNAP_COUNT; i++) {
+        const struct ds41_snap *sn = &s->ds41_snaps[i];
+        if (!sn->valid || (int)sn->pos > max_pos || (int)sn->pos > s->checkpoint.len ||
+            (int)sn->pos <= best) continue;
+        if (sn->token_hash != ds41_snap_hash(s, sn->pos)) continue;
+        best = (int)sn->pos;
+    }
+    return best;
+}
+
+static bool ds41_snap_restore(ds4_session *s, int pos) {
+    if (ds41_snap_best(s, pos) != pos) return false;
+    struct ds41_snap *sn = NULL;
+    for (uint32_t i = 0; i < DS41_SNAP_COUNT; i++)
+        if (s->ds41_snaps[i].valid && (int)s->ds41_snaps[i].pos == pos) sn = &s->ds41_snaps[i];
+    if (!sn) return false;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    if (!ds4_gpu_synchronize()) return false;
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < 40; il++)
+        ok = ds4_gpu_tensor_write(g->window[il], 0, sn->state + (size_t)il * DS41_SNAP_WINDOW_FLOATS,
+                                  (uint64_t)DS41_SNAP_WINDOW_FLOATS * 4u) != 0;
+    const float *prev = sn->state + (size_t)40u * DS41_SNAP_WINDOW_FLOATS;
+    for (uint32_t i = 0; ok && i < 3; i++)
+        ok = ds4_gpu_tensor_write(g->previous_kv[i], 0, prev + i * 1024u, 512u * 4u) != 0 &&
+             ds4_gpu_tensor_write(g->previous_score[i], 0, prev + i * 1024u + 512u, 512u * 4u) != 0;
+    if (!ok) {
+        s->checkpoint_valid = false;
+        g->valid = false;
+        ds41_snaps_clear(s);
+        return false;
+    }
+    ds41_graph_reset(g);
+    g->history = sn->history;
+    g->pos = (uint32_t)pos;
+    memcpy(s->logits, sn->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    s->checkpoint.len = pos;
+    s->checkpoint_valid = true;
+    /* Later snapshots describe rows the replay will overwrite. */
+    for (uint32_t i = 0; i < DS41_SNAP_COUNT; i++)
+        if (s->ds41_snaps[i].valid && (int)s->ds41_snaps[i].pos > pos) s->ds41_snaps[i].valid = false;
+    s->ds41_snap_last_pos = (uint32_t)pos;
+    /* Keep only the images that lie wholly before the rewind point. */
+    size_t keep = 0;
+    while (keep < s->checkpoint_image_count &&
+           (uint64_t)s->checkpoint_images[keep].token_start +
+           s->checkpoint_images[keep].token_count <= (uint64_t)pos) keep++;
+    s->checkpoint_image_count = keep;
+    if (!keep) {
+        free(s->checkpoint_images);
+        s->checkpoint_images = NULL;
+    }
+    return true;
 }
 #endif
 #ifdef DS4_HAS_QWEN4_GPU
@@ -77626,6 +77782,7 @@ void ds4_session_free(ds4_session *s) {
 #ifndef DS4_NO_GPU
     else {
 #ifdef DS4_HAS_DEEPSEEK41_GPU
+        ds41_snaps_free(s);
         if (s->ds41_graph_ready) {
             s->engine->ds41_session_bytes -= s->ds41_graph.allocation_bytes;
             ds41_graph_free(&s->ds41_graph);
@@ -79757,8 +79914,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         if (!s->checkpoint_valid || !g->valid || g->pos != (uint32_t)s->checkpoint.len ||
             !ds4_tokens_starts_with(prompt, &s->checkpoint)) {
             ds41_graph_reset(g);
+            ds41_snaps_clear(s);
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
+        } else if (prompt->len > s->checkpoint.len) {
+            ds41_snap_capture(s, true);
         }
         bool pending_logits = false, interrupted = false, decoder_pending = false;
         ds41_encoder_residency encoder = {0};
@@ -79843,6 +80003,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             snprintf(err, errlen, "interrupted");
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
+        ds41_snap_capture(s, true);
         return 0;
     }
 #endif
@@ -81717,6 +81878,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     ds4_engine *e = s->engine;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
+        if (s->ds41_graph_ready) ds41_snap_capture(s, false);
         if (!s->ds41_graph_ready ||
             (!s->checkpoint_valid && s->checkpoint.len != 0) ||
             s->ds41_graph.pos != (uint32_t)s->checkpoint.len ||
@@ -89106,6 +89268,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
                              char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_snap_capture(s, false);
     /* Without a drafter the proposals come from prompt lookup only, and the
      * verification state is installed as g->draft just around the verify. */
     const bool lookup_only = !g->draft;
@@ -90500,6 +90663,7 @@ void ds4_session_invalidate(ds4_session *s) {
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (s->ds41_graph_ready) ds41_graph_reset(&s->ds41_graph);
+    ds41_snaps_clear(s);
 #endif
     ds4_session_glm_reset_dense_cache(s);
 #endif
@@ -90551,6 +90715,10 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (s->checkpoint_valid && ds4_session_is_ds41(s) && !s->distributed)
+        state_ok = ds41_snap_restore(s, pos);
+#endif
 #endif
     s->checkpoint.len = pos;
     /* DeepSeek compressors cannot be rolled back by truncating their row
@@ -90567,6 +90735,15 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 
 int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
+}
+
+int ds4_session_rewind_point(ds4_session *s, int max_pos) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (s && !s->distributed && ds4_session_is_ds41(s)) return ds41_snap_best(s, max_pos);
+#else
+    (void)s; (void)max_pos;
+#endif
+    return -1;
 }
 
 bool ds4_session_checkpoint_valid(const ds4_session *s) {
