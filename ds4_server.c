@@ -14065,10 +14065,22 @@ decode_again:
          * several tokens at a time. Not while tool-call syntax is forced
          * greedy or client stop strings could end the reply inside a block:
          * a V4.1 session cannot rewind cheaply. */
-        const bool lookup_ok = !s->batched_mode && !greedy_tool_syntax &&
+        /* Tool-call syntax is decoded greedily and is nearly the same text in
+         * every call (about 60 tokens per call in a recorded agent session,
+         * 13 % of all generated tokens): lookup may draft it one tag at a
+         * time (DS4_V41_LOOKUP_SYNTAX=0 keeps it token by token). */
+        static int lookup_syntax_on = -1;
+        if (lookup_syntax_on < 0) {
+            const char *v = getenv("DS4_V41_LOOKUP_SYNTAX");
+            lookup_syntax_on = !(v && v[0] == '0');
+        }
+        const bool lookup_base = !s->batched_mode &&
             !j->req.ignore_eos && j->req.stops.len == 0;
+        const bool lookup_syntax = lookup_base && greedy_tool_syntax && lookup_syntax_on;
+        const bool lookup_ok = lookup_base && (!greedy_tool_syntax || lookup_syntax);
         const bool lookup = lookup_ok && ds4_session_lookup_available(slot->session);
         ds4_session_set_lookup(slot->session, lookup_ok);
+        ds4_session_set_lookup_syntax(slot->session, lookup_syntax);
         if (!s->batched_mode &&
             (ds4_engine_mtp_draft_tokens(s->engine) > 1 || lookup) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)

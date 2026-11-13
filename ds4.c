@@ -41628,12 +41628,20 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (prefetched) {
         /* router and expert fetch already issued pre-attention */
     } else {
+#ifdef DS4_ROCM_BUILD
+        /* Experiment (DS4_V41_MISS_PENALTY): see ds4_gpu_dsv41_route_penalty_begin. */
+        const int penalized = g->streaming && bias == l->ffn_exp_probs_b ?
+            ds4_gpu_dsv41_route_penalty_begin(m->map, m->size, bias->abs_offset, il) : 0;
+#endif
         ok = ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) &&
             ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
                 m->map, m->size, bias->abs_offset, 0, 0, token,
                 DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
                 g->route_logits) &&
             ds41_five_experts(g->route_weights, 1u);
+#ifdef DS4_ROCM_BUILD
+        if (penalized) ds4_gpu_dsv41_route_penalty_end();
+#endif
     }
     if (profile) ok = ds41_decode_stage_profile_mark("moe_route", il, start, ok);
     if (!ok) return false;
@@ -42558,6 +42566,7 @@ static bool ds41_five_experts(ds4_gpu_tensor *weights, uint32_t rows) {
     return true;
 #endif
 }
+static uint32_t g_ds41_route_layer;   /* layer of the batch being routed (miss-penalty experiment) */
 static bool ds41_route_batch_six(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t count);
 static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
@@ -42568,11 +42577,23 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_route_batch_six(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
-    if (!g->image_count) return ds4_gpu_router_select_batch_tensor(
-        b->selected, b->route_weights, b->route_probs, m->map, m->size,
-        l->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
-        b->route_logits, g->prefill_tokens, DS4_N_EXPERT, DS4_N_EXPERT_USED,
-        DS4_EXPERT_WEIGHT_SCALE, count);
+    if (!g->image_count) {
+#ifdef DS4_ROCM_BUILD
+        /* Speculative verifies select like one-token decode (miss-penalty experiment). */
+        const int penalized = g->streaming && g->draft && g->draft->verify_rows ?
+            ds4_gpu_dsv41_route_penalty_begin(m->map, m->size,
+                l->ffn_exp_probs_b->abs_offset, g_ds41_route_layer) : 0;
+#endif
+        const bool routed = ds4_gpu_router_select_batch_tensor(
+            b->selected, b->route_weights, b->route_probs, m->map, m->size,
+            l->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
+            b->route_logits, g->prefill_tokens, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+            DS4_EXPERT_WEIGHT_SCALE, count);
+#ifdef DS4_ROCM_BUILD
+        if (penalized) ds4_gpu_dsv41_route_penalty_end();
+#endif
+        return routed;
+    }
     /* The ordinary 384-expert selector already has the right scoring and
      * normalization. Split only where the text/visual selection bias changes. */
     for (uint32_t first = 0; first < count;) {
@@ -42681,6 +42702,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 #endif
     ok = ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false);
     ds41_sub("ffn router matmul");
+    g_ds41_route_layer = il;
     ok = ok && ds41_route_batch(g, m, l, count);
     ds41_sub("ffn route select");
 #ifdef DS4_ROCM_BUILD
@@ -64105,6 +64127,7 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool lookup_allowed;   /* caller permits prompt-lookup drafts for the next eval */
+    bool lookup_syntax;    /* ... and the next tokens are forced-greedy tool-call syntax */
     bool greedy_splitkv_anchor_valid;
 };
 
@@ -66021,7 +66044,12 @@ bool ds4_session_lookup_available(ds4_session *s) {
 #endif
 }
 void ds4_session_set_lookup(ds4_session *s, bool allowed) {
-    if (s) s->lookup_allowed = allowed;
+    if (s) { s->lookup_allowed = allowed; s->lookup_syntax = false; }
+}
+/* The next tokens are tool-call syntax that the caller decodes greedily:
+ * lookup drafts are allowed and end with the token that closes a tag. */
+void ds4_session_set_lookup_syntax(ds4_session *s, bool syntax) {
+    if (s) { s->lookup_syntax = syntax; if (syntax) s->lookup_allowed = true; }
 }
 
 #ifndef DS4_NO_GPU
@@ -88739,8 +88767,9 @@ static bool ds41_draft_should_propose(bool draftable, bool cost_scheduled,
     return !skip_left || adaptive_off;
 }
 
-static bool ds41_lookup_control_token(const ds4_engine *e, int token) {
+static bool ds41_lookup_control_token(const ds4_engine *e, int token, bool allow_dsml) {
     const ds4_vocab *v = &e->vocab;
+    if (allow_dsml && v->dsml_id >= 0 && token == v->dsml_id) return false;
     const int ids[] = {
         v->bos_id, v->eos_id, v->system_id, v->user_id, v->assistant_id,
         v->observation_id, v->sop_id, v->think_start_id, v->think_end_id,
@@ -89214,7 +89243,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
             if (!ignore_eos && drafts[i] == eos_token) { k = i; break; }
             if (ignore_eos && ds4_token_is_stop_for_think_mode(
                     e, drafts[i], think_mode)) { k = i; break; }
-            if (ds41_lookup_control_token(e, drafts[i])) { k = i; break; }
+            if (ds41_lookup_control_token(e, drafts[i], false)) { k = i; break; }
         }
     }
     if (lookup_n) {
@@ -89231,7 +89260,16 @@ static int ds41_session_spec(ds4_session *s, int first_token,
             /* Never draft a control token or past one: the caller's parser
              * state (tool calls, thinking, sampling mode) changes there and a
              * V4.1 session cannot rewind cheaply. */
-            if (ds41_lookup_control_token(e, drafts[i])) { k = i; break; }
+            if (ds41_lookup_control_token(e, drafts[i], s->lookup_syntax)) { k = i; break; }
+            /* Tool-call syntax (forced greedy by the caller): a draft may run
+             * through the markup of one tag, DSML token included, but ends
+             * with the token that closes the tag. What follows a tag is either
+             * a sampled payload, which must not be verified greedily, or the
+             * end of the tool call, past which the caller cannot rewind. */
+            if (s->lookup_syntax) {
+                const ds4_str *ts = &e->vocab.token[drafts[i]];
+                if (ts->ptr && memchr(ts->ptr, '>', (size_t)ts->len)) { k = i + 1u; break; }
+            }
         }
     }
     if (stats) {

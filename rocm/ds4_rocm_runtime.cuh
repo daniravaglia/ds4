@@ -453,6 +453,65 @@ static int cuda_u64_mul3_checked(uint64_t a, uint64_t b, uint64_t c, uint64_t *o
     return cuda_u64_mul_checked(a, b, &tmp) && cuda_u64_mul_checked(tmp, c, out);
 }
 
+/* Experiment, off unless DS4_V41_MISS_PENALTY=F (changes the model's output
+ * and makes it depend on the cache): subtract F from the router's SELECTION
+ * score of experts that are not resident, so that among near-tied candidates
+ * a resident one is picked and the SSD read is avoided. The mixing weights
+ * still come from the unpenalized probabilities of whatever is selected. Per
+ * layer a device row holds bias - penalty; it is rebuilt when the layer's
+ * residency changed. Only for one-token decode and speculative verifies of
+ * text positions; prefill selects as usual. */
+static uint8_t g_v41_pen_resident[40][DS4_ROCM_N_EXPERT];
+static uint8_t g_v41_pen_dirty[40];
+static float *g_v41_pen_dev;
+static float g_v41_pen_f = -1.0f;
+static uint64_t g_v41_pen_uploads;
+static void v41_pen_note(uint32_t layer, int32_t expert, uint8_t resident) {
+    if (layer < 40u && expert >= 0 && expert < (int32_t)DS4_ROCM_N_EXPERT &&
+        g_v41_pen_resident[layer][expert] != resident) {
+        g_v41_pen_resident[layer][expert] = resident;
+        g_v41_pen_dirty[layer] = 1;
+    }
+}
+static void v41_pen_clear(void) {
+    memset(g_v41_pen_resident, 0, sizeof(g_v41_pen_resident));
+    memset(g_v41_pen_dirty, 1, sizeof(g_v41_pen_dirty));
+}
+extern "C" int ds4_gpu_dsv41_route_penalty_begin(const void *model_map, uint64_t model_size,
+        uint64_t bias_offset, uint32_t layer) {
+    if (g_v41_pen_f < 0.0f) {
+        const char *v = getenv("DS4_V41_MISS_PENALTY");
+        g_v41_pen_f = v && v[0] ? (float)atof(v) : 0.0f;
+        if (g_v41_pen_f < 0.0f) g_v41_pen_f = 0.0f;
+        if (g_v41_pen_f > 0.0f) {
+            fprintf(stderr, "ds4: V4.1 EXPERIMENT: miss penalty %.4f on the selection score of "
+                    "non-resident experts\n", (double)g_v41_pen_f);
+            memset(g_v41_pen_dirty, 1, sizeof(g_v41_pen_dirty));
+        }
+    }
+    if (g_v41_pen_f <= 0.0f || layer >= 40u || !model_map ||
+        bias_offset > model_size ||
+        model_size - bias_offset < DS4_ROCM_N_EXPERT * sizeof(float)) return 0;
+    if (!g_v41_pen_dev &&
+        !cuda_ok(cudaMalloc(&g_v41_pen_dev, 40u * DS4_ROCM_N_EXPERT * sizeof(float)),
+                 "V4.1 miss-penalty bias")) return 0;
+    if (g_v41_pen_dirty[layer]) {
+        const float *bias = (const float *)((const char *)model_map + bias_offset);
+        float row[DS4_ROCM_N_EXPERT];
+        for (uint32_t e = 0; e < DS4_ROCM_N_EXPERT; e++)
+            row[e] = bias[e] - (g_v41_pen_resident[layer][e] ? 0.0f : g_v41_pen_f);
+        if (!cuda_ok(cudaMemcpy(g_v41_pen_dev + (size_t)layer * DS4_ROCM_N_EXPERT, row, sizeof(row),
+                                cudaMemcpyHostToDevice), "V4.1 miss-penalty upload")) return 0;
+        g_v41_pen_dirty[layer] = 0;
+        g_v41_pen_uploads++;
+    }
+    g_v41_route_bias_override = g_v41_pen_dev + (size_t)layer * DS4_ROCM_N_EXPERT;
+    return 1;
+}
+extern "C" void ds4_gpu_dsv41_route_penalty_end(void) {
+    g_v41_route_bias_override = NULL;
+}
+
 static int cuda_stream_cache_layer_stats_on(void) {
     if (g_stream_cache_layer_stats_enabled < 0) {
         g_stream_cache_layer_stats_enabled =
@@ -748,6 +807,7 @@ static void cuda_stream_resident_cache_release(void) {
         if (e.base && !e.pooled) (void)cudaFree(e.base);
     }
     g_stream_resident_experts.clear();
+    v41_pen_clear();
     g_stream_resident_index.clear();
     g_stream_resident_bytes = 0;
     g_stream_resident_clock = 0;
@@ -1652,6 +1712,7 @@ static int cuda_stream_resident_evict_at(size_t idx) {
     } else {
         g_stream_resident_bytes = 0;
     }
+    v41_pen_note(e.layer, e.expert, 0);
     g_stream_resident_index.erase(evicted_key);
     const size_t last = g_stream_resident_experts.size() - 1u;
     if (idx != last) {
@@ -1924,6 +1985,7 @@ static int cuda_stream_resident_alloc(
     e.last_used = ++g_stream_resident_clock;
     e.pooled = pooled;
     g_stream_resident_experts.push_back(e);
+    v41_pen_note(e.layer, e.expert, 1);
     g_stream_resident_index[cuda_stream_resident_entry_key(e)] =
         g_stream_resident_experts.size() - 1u;
     g_stream_resident_bytes += bytes;

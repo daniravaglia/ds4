@@ -51,6 +51,10 @@ extern "C" void ds4_gpu_set_dspark_verify_mode(bool enabled) {
 /* V4.1 small batches whose routed experts use the one-token decode
  * arithmetic (prompt-lookup verification). */
 static thread_local bool g_v41_decode_like_batch;
+/* Experiment (DS4_V41_MISS_PENALTY): selection bias with the miss penalty
+ * applied, used by the router selection instead of the model's bias while
+ * set (NULL: the model's bias). */
+static const float *g_v41_route_bias_override;
 extern "C" void ds4_gpu_set_v41_decode_like_batch(bool enabled) {
     g_v41_decode_like_batch = enabled;
 }

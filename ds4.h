@@ -606,6 +606,7 @@ bool ds4_engine_mtp_exact_sampling(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 bool ds4_session_lookup_available(ds4_session *s);
 void ds4_session_set_lookup(ds4_session *s, bool allowed);
+void ds4_session_set_lookup_syntax(ds4_session *s, bool syntax);
 
 /* Low-level graph slice entry points used by distributed inference.  The
  * transport/session routing logic lives in ds4_distributed.c. */
