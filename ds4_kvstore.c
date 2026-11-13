@@ -30,6 +30,8 @@
  * file version because the KVC envelope can remain stable while the serialized
  * ds4_session internals become unsafe to restore across runtime changes. */
 #define KV_CACHE_PAYLOAD_ABI 2u
+#define KV_CACHE_RECENCY_WEIGHT 4.0
+#define KV_CACHE_RECENCY_HALF_LIFE_SECONDS (30ull * 60ull)
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
 #define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
 /* Tokenizers may merge text across the prompt boundary. Trimming a small tail
@@ -551,7 +553,18 @@ double ds4_kvstore_entry_eviction_score(
         effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
     }
-    double score = (effective_hits + 1.0) *
+    /* Recency: a checkpoint that was just stored or used is the most likely
+     * to be needed again (agent side requests and subagents alternate with
+     * the main session within minutes). Without this term every unused
+     * entry scored the same tokens/byte, so a fresh small checkpoint was
+     * evicted by the next large store while hours-old ones survived. */
+    double recency = 0.0;
+    if (used_at != 0) {
+        const double age = now > used_at ? (double)(now - used_at) : 0.0;
+        recency = KV_CACHE_RECENCY_WEIGHT *
+                  exp2(-age / (double)KV_CACHE_RECENCY_HALF_LIFE_SECONDS);
+    }
+    double score = (effective_hits + 1.0 + recency) *
                    (double)e->tokens / (double)e->file_size;
     if (kv_cache_reason_is_anchor(e->reason))
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;

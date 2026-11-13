@@ -22430,9 +22430,20 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     double f_on = kv_entry_eviction_score(&fresh, NULL, now, NULL);
     TEST_ASSERT(s_on < f_on);
 
-    /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
-     * regardless of how old another entry's hit history is. */
-    TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
+    /* A just-stored entry scores (0 hits + 1 + full recency bonus) per
+     * token/byte, regardless of how old another entry's hit history is. */
+    TEST_ASSERT(f_on == 5.0 * (double)fresh.tokens / (double)fresh.file_size);
+}
+
+static void test_kv_cache_eviction_keeps_fresh_small_checkpoint(void) {
+    /* Agent pattern of 2026-11-13: a subagent's 8K-token checkpoint was
+     * evicted by the next main-session store while hours-old, never-used
+     * 90K-token checkpoints with a slightly better tokens/byte survived. */
+    const uint64_t now = 100000u;
+    kv_entry old_big = {.tokens = 90000, .hits = 0, .file_size = 560000, .last_used = now - 3u * 3600u};
+    kv_entry fresh_small = {.tokens = 8000, .hits = 0, .file_size = 59000, .last_used = now - 60u};
+    TEST_ASSERT(kv_entry_eviction_score(&old_big, NULL, now, NULL) <
+                kv_entry_eviction_score(&fresh_small, NULL, now, NULL));
 }
 
 static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
@@ -23337,6 +23348,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
+    test_kv_cache_eviction_keeps_fresh_small_checkpoint();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
