@@ -140,7 +140,7 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
     if (ok && has_bias && !hash_mode) {
         if (!cuda_model_range_fits(model_size, bias_offset, active_n_expert * sizeof(float))) ok = 0;
         else bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, active_n_expert * sizeof(float), "router_bias");
-        if (bias && g_v41_route_bias_override && active_n_expert == DS4_ROCM_N_EXPERT) bias = g_v41_route_bias_override;
+        if (bias && g_v41_route_bias_override && active_n_expert == DS4_ROCM_MAX_N_EXPERT) bias = g_v41_route_bias_override;
         if (!bias) ok = 0;
     }
     if (ok && hash_mode) {
@@ -203,7 +203,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
     if (has_bias && !hash_mode) {
         if (!cuda_model_range_fits(model_size, bias_offset, active_n_expert * sizeof(float))) return 0;
         bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, active_n_expert * sizeof(float), "router_bias");
-        if (bias && g_v41_route_bias_override && active_n_expert == DS4_ROCM_N_EXPERT) bias = g_v41_route_bias_override;
+        if (bias && g_v41_route_bias_override && active_n_expert == DS4_ROCM_MAX_N_EXPERT) bias = g_v41_route_bias_override;
         if (!bias) return 0;
     }
     if (hash_mode) {

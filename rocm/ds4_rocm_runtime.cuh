@@ -461,13 +461,13 @@ static int cuda_u64_mul3_checked(uint64_t a, uint64_t b, uint64_t c, uint64_t *o
  * layer a device row holds bias - penalty; it is rebuilt when the layer's
  * residency changed. Only for one-token decode and speculative verifies of
  * text positions; prefill selects as usual. */
-static uint8_t g_v41_pen_resident[40][DS4_ROCM_N_EXPERT];
+static uint8_t g_v41_pen_resident[40][DS4_ROCM_MAX_N_EXPERT];
 static uint8_t g_v41_pen_dirty[40];
 static float *g_v41_pen_dev;
 static float g_v41_pen_f = -1.0f;
 static uint64_t g_v41_pen_uploads;
 static void v41_pen_note(uint32_t layer, int32_t expert, uint8_t resident) {
-    if (layer < 40u && expert >= 0 && expert < (int32_t)DS4_ROCM_N_EXPERT &&
+    if (layer < 40u && expert >= 0 && expert < (int32_t)DS4_ROCM_MAX_N_EXPERT &&
         g_v41_pen_resident[layer][expert] != resident) {
         g_v41_pen_resident[layer][expert] = resident;
         g_v41_pen_dirty[layer] = 1;
@@ -491,21 +491,21 @@ extern "C" int ds4_gpu_dsv41_route_penalty_begin(const void *model_map, uint64_t
     }
     if (g_v41_pen_f <= 0.0f || layer >= 40u || !model_map ||
         bias_offset > model_size ||
-        model_size - bias_offset < DS4_ROCM_N_EXPERT * sizeof(float)) return 0;
+        model_size - bias_offset < DS4_ROCM_MAX_N_EXPERT * sizeof(float)) return 0;
     if (!g_v41_pen_dev &&
-        !cuda_ok(cudaMalloc(&g_v41_pen_dev, 40u * DS4_ROCM_N_EXPERT * sizeof(float)),
+        !cuda_ok(cudaMalloc(&g_v41_pen_dev, 40u * DS4_ROCM_MAX_N_EXPERT * sizeof(float)),
                  "V4.1 miss-penalty bias")) return 0;
     if (g_v41_pen_dirty[layer]) {
         const float *bias = (const float *)((const char *)model_map + bias_offset);
-        float row[DS4_ROCM_N_EXPERT];
-        for (uint32_t e = 0; e < DS4_ROCM_N_EXPERT; e++)
+        float row[DS4_ROCM_MAX_N_EXPERT];
+        for (uint32_t e = 0; e < DS4_ROCM_MAX_N_EXPERT; e++)
             row[e] = bias[e] - (g_v41_pen_resident[layer][e] ? 0.0f : g_v41_pen_f);
-        if (!cuda_ok(cudaMemcpy(g_v41_pen_dev + (size_t)layer * DS4_ROCM_N_EXPERT, row, sizeof(row),
+        if (!cuda_ok(cudaMemcpy(g_v41_pen_dev + (size_t)layer * DS4_ROCM_MAX_N_EXPERT, row, sizeof(row),
                                 cudaMemcpyHostToDevice), "V4.1 miss-penalty upload")) return 0;
         g_v41_pen_dirty[layer] = 0;
         g_v41_pen_uploads++;
     }
-    g_v41_route_bias_override = g_v41_pen_dev + (size_t)layer * DS4_ROCM_N_EXPERT;
+    g_v41_route_bias_override = g_v41_pen_dev + (size_t)layer * DS4_ROCM_MAX_N_EXPERT;
     return 1;
 }
 extern "C" void ds4_gpu_dsv41_route_penalty_end(void) {

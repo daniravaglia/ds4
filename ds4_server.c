@@ -13462,6 +13462,17 @@ static void *decode_worker_main(void *arg) {
     return NULL;
 }
 
+/* DS4_SERVER_IMAGE_PREFIX_KV=0 restores full reprocessing of image sessions
+ * after a live-cache miss. */
+static bool server_image_prefix_kv_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_SERVER_IMAGE_PREFIX_KV");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -13693,6 +13704,51 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    /* Sessions with images have no disk checkpoints (the files carry no
+     * image identity), so a live miss used to reprocess the whole prompt.
+     * The text before the first image is an ordinary text prefix: restore
+     * the longest checkpoint inside it and let the multimodal sync continue
+     * from there. The restored tokens must be an exact prefix of this
+     * request's tokens, else the session is dropped as before. */
+    if (multimodal && cached == 0 && s->kv.enabled && !responses_protocol &&
+        j->req.prompt_text && j->req.image_markers && j->req.images &&
+        server_image_prefix_kv_on() &&
+        (int)j->req.images[0].token_start >= s->kv.opt.min_tokens)
+    {
+        const char *marker = strstr(j->req.prompt_text, j->req.image_markers[0]);
+        if (marker) {
+            if (old_pos >= s->kv.opt.min_tokens)
+                kv_cache_store_current(s, slot, "evict");
+            char *text_prefix = xstrndup(j->req.prompt_text,
+                                         (size_t)(marker - j->req.prompt_text));
+            ds4_tokens scratch = {0};
+            uint8_t ext = 0;
+            int loaded = kv_cache_try_load_text(s, slot, text_prefix, &scratch,
+                                                &disk_cache_path, &ext, false);
+            ds4_tokens_free(&scratch);
+            free(text_prefix);
+            if (loaded > 0) {
+                pthread_mutex_lock(&s->inference_mu);
+                const int pos = ds4_session_pos(slot->session);
+                const bool usable =
+                    pos > 0 && pos <= (int)j->req.images[0].token_start &&
+                    ds4_session_common_prefix(slot->session, &j->req.prompt) == pos;
+                if (!usable) ds4_session_invalidate(slot->session);
+                pthread_mutex_unlock(&s->inference_mu);
+                if (usable) {
+                    cached = disk_cached = pos;
+                    cache_source = "disk-text-prefix";
+                } else {
+                    free(disk_cache_path);
+                    disk_cache_path = NULL;
+                }
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: multimodal text-prefix checkpoint %s tokens=%d first_image=%u prompt=%d",
+                           usable ? "restored" : "rejected (token mismatch)",
+                           pos, j->req.images[0].token_start, j->req.prompt.len);
+            }
+        }
+    }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
         ((!strcmp(cache_source, "responses-visible") ||
@@ -13790,6 +13846,22 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                                     ds4_token_assistant(s->engine));
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+    }
+    if (multimodal && cached == 0 && s->kv.enabled && !responses_protocol &&
+        j->req.images && server_image_prefix_kv_on() &&
+        (int)j->req.images[0].token_start >= s->kv.opt.min_tokens)
+    {
+        /* Store the stable chat prefix (everything before the first user
+         * message) when it lies before the first image: the next compacted
+         * or restarted image session restores it instead of recomputing. */
+        ds4_tokens view = *prompt_for_sync;
+        view.len = (int)j->req.images[0].token_start;
+        const int anchor = kv_cache_chat_anchor_pos(&s->kv, &view,
+                                                    ds4_token_user(s->engine),
+                                                    ds4_token_assistant(s->engine));
+        if (anchor >= s->kv.opt.min_tokens &&
+            (s->kv.opt.cold_max_tokens <= 0 || anchor <= s->kv.opt.cold_max_tokens))
+            cold_store_len = anchor;
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
