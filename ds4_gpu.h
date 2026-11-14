@@ -465,6 +465,10 @@ int ds4_gpu_stream_expert_cache_reserve_layers(
 int ds4_gpu_stream_expert_cache_note_layer_consumed(
         const ds4_gpu_stream_expert_table *table);
 int ds4_gpu_stream_expert_cache_quiesce(void);
+/* DS4_ROCM_STREAM_ACCESS_LOG diagnostics (ROCm only; see rocm/ds4_rocm_runtime.cuh). */
+int ds4_gpu_stream_access_log_on(void);
+void ds4_gpu_stream_access_note_prefill(uint32_t layer, uint32_t pos, const int32_t *selected,
+                                        uint32_t rows, uint32_t per_row, int last);
 int ds4_gpu_stream_expert_cache_get_memory(ds4_gpu_stream_expert_memory *out);
 int ds4_gpu_stream_expert_cache_load_layer(
         const ds4_gpu_stream_expert_table *table);
@@ -512,6 +516,10 @@ int ds4_gpu_dsv41_stream_prepare_layer_selected(
  * plans for batches the routed FP16 kernel takes stage only the experts read
  * from disk and leave routed residents in the dynamic cache. */
 void ds4_gpu_dsv41_stream_selected_rows_hint(uint32_t rows);
+/* Direct staging (ROCm V4.1 SSD streaming): staged experts are read into the
+ * dynamic cache, so the two layer slots need not be reserved. */
+int ds4_gpu_dsv41_stream_direct_stage_available(void);
+int ds4_gpu_dsv41_stream_direct_noslot(void);
 /* Keep what the loaded selected plan `prev` staged for this layer and plan
  * reads only for the newly selected experts that are not staged yet. */
 int ds4_gpu_dsv41_stream_prepare_layer_topup(

@@ -44048,6 +44048,14 @@ static bool ds41_stream_layer_start(ds41_stream_layer_load *job,
     ds4_gpu_stream_expert_table table;
     if (!job || job->active || il >= DS4_N_LAYER ||
         !ds41_stream_table(m, &w->layer[il], il, &table)) return false;
+    if (ds4_gpu_dsv41_stream_direct_noslot()) {
+        /* No layer slots: a whole layer is a selected plan of every expert,
+         * staged into the dynamic cache. */
+        static int32_t all[DS4_MAX_EXPERT];
+        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) all[i] = (int32_t)i;
+        ds4_gpu_dsv41_stream_selected_rows_hint(2048u);
+        return ds41_stream_layer_start_plan(job, &table, all, DS4_N_EXPERT);
+    }
     return ds41_stream_layer_start_plan(job, &table, NULL, 0);
 }
 
@@ -44070,6 +44078,12 @@ static bool ds41_stream_layer_start_full_l(ds41_stream_layer_load *job,
     ds4_gpu_stream_expert_table table;
     if (!job || job->active || il >= DS4_N_LAYER ||
         !ds41_stream_table(m, l, il, &table)) return false;
+    if (ds4_gpu_dsv41_stream_direct_noslot()) {
+        static int32_t all[DS4_MAX_EXPERT];
+        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) all[i] = (int32_t)i;
+        ds4_gpu_dsv41_stream_selected_rows_hint(2048u);
+        return ds41_stream_layer_start_plan(job, &table, all, DS4_N_EXPERT);
+    }
     return ds41_stream_layer_start_plan(job, &table, NULL, 0);
 }
 
@@ -45335,6 +45349,16 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (ok && ds41_stream_prefill_selected_profile_enabled(g)) {
                 ok = ds41_stream_prefill_selected_profile_layer(
                         g, &w->layer[il], il, count, start);
+            }
+#endif
+#ifdef DS4_ROCM_BUILD
+            if (ok && g->streaming && count <= 2048u && ds4_gpu_stream_access_log_on()) {
+                static int32_t access_ids[2048u * DS4_MAX_EXPERT_USED];
+                if (ds4_gpu_tensor_read(g->batch.selected, 0, access_ids,
+                        (uint64_t)count * DS4_N_EXPERT_USED * sizeof(int32_t)))
+                    ds4_gpu_stream_access_note_prefill(il, start, access_ids, count,
+                        DS4_N_EXPERT_USED, encoder_only || off + count != total_count ? 0 :
+                        initial_start > 0u ? 2 : 1);
             }
 #endif
             if (ok && !encoder_only && off + count == total_count)
@@ -72442,7 +72466,10 @@ static bool ds41_stream_cache_configure(ds4_engine *e) {
         if (expert && expert != bytes) return false;
         expert = bytes;
     }
-    const uint64_t slots = 2u * DS4_N_EXPERT * expert;
+    /* With direct staging the two layer slots are not reserved: staged
+     * experts are read into the dynamic cache, which gets their memory. */
+    const bool direct = ds4_gpu_dsv41_stream_direct_stage_available() != 0;
+    const uint64_t slots = direct ? 0 : 2u * DS4_N_EXPERT * expert;
     const uint64_t requested = e->ssd_streaming_cache_bytes;
     const uint32_t maximum = DS4_N_LAYER * DS4_N_EXPERT;
     uint64_t count = e->ssd_streaming_cache_experts;
@@ -76060,7 +76087,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     !ds41_stream_table(&e->model, &e->weights.layer[0], 0, &even) ||
                     !ds41_stream_table(&e->model, &e->weights.layer[1], 1, &odd) ||
                     !ds4_gpu_stream_expert_cache_quiesce() ||
-                    !ds4_gpu_stream_expert_cache_reserve_layers(&even, &odd)) {
+                    (e->ssd_streaming_prefill_headroom_bytes != 0 &&
+                     !ds4_gpu_stream_expert_cache_reserve_layers(&even, &odd))) {
                     fprintf(stderr, "ds4: V4.1 SSD failed to reserve both admitted expert layers\n");
                     ds4_engine_close(e);
                     *out = NULL;
