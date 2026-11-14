@@ -160,6 +160,7 @@ struct cuda_stream_resident_expert {
     uint64_t bytes;
     uint64_t last_used;
     int pooled;
+    int prot;            /* hit since it was loaded (segmented LRU) */
 };
 
 /*
@@ -361,6 +362,16 @@ static std::unordered_map<cuda_stream_resident_key,
                           cuda_stream_resident_key_hash> g_stream_resident_index;
 static uint64_t g_stream_resident_bytes;
 static uint64_t g_stream_resident_clock;
+static size_t g_stream_resident_protected;
+
+/* A hit moves an expert to the protected segment. */
+static inline void cuda_stream_resident_touch(cuda_stream_resident_expert &e) {
+    e.last_used = ++g_stream_resident_clock;
+    if (!e.prot) {
+        e.prot = 1;
+        g_stream_resident_protected++;
+    }
+}
 static std::vector<cuda_stream_expert_slab> g_stream_expert_slabs;
 static std::vector<char *> g_stream_expert_free_slots;
 static uint64_t g_stream_expert_slot_bytes;
@@ -811,6 +822,7 @@ static void cuda_stream_resident_cache_release(void) {
     g_stream_resident_index.clear();
     g_stream_resident_bytes = 0;
     g_stream_resident_clock = 0;
+    g_stream_resident_protected = 0;
     for (cuda_stream_expert_slab &slab : g_stream_expert_slabs) {
         if (slab.base) (void)cudaFree(slab.base);
     }
@@ -1697,6 +1709,7 @@ static int cuda_stream_resident_evict_at(size_t idx) {
         return 0;
     }
     cuda_stream_resident_expert &e = g_stream_resident_experts[idx];
+    if (e.prot && g_stream_resident_protected) g_stream_resident_protected--;
     const cuda_stream_resident_key evicted_key =
         cuda_stream_resident_entry_key(e);
     if (cuda_stream_cache_stats_on()) {
@@ -1750,17 +1763,50 @@ static int cuda_stream_resident_evict_one(
             return cuda_stream_resident_evict_at(victim);
         }
     }
+    /* Segmented LRU: experts hit since they were loaded are protected;
+     * the victim is the least recently used unprotected one. Protected
+     * experts beyond 95 % of the cache are demoted, the oldest first, one
+     * per eviction (to the most recent end). Plain LRU let the experts a
+     * prompt seeds, or a reply touches once, push out experts that decode
+     * keeps reusing. Server replay of 22 recorded agent requests (A/B/B/A):
+     * decode misses -10.6 %, decode 13.31 -> 13.57 tok/s, prompt time
+     * 741 -> 717 s; a cache simulator fed with the logged accesses of two
+     * traces gave -12.5 / -14.6 % decode misses (Belady's optimum -63 %).
+     * DS4_ROCM_STREAM_EVICT_LRU=1 restores plain LRU. */
+    static int plain = -1;
+    if (plain < 0) {
+        const char *v = getenv("DS4_ROCM_STREAM_EVICT_LRU");
+        plain = v && v[0] == '1';
+    }
     oldest = UINT64_MAX;
+    uint64_t oldest_prot = UINT64_MAX;
+    size_t victim_prot = (size_t)-1;
     for (size_t i = 0; i < g_stream_resident_experts.size(); i++) {
         const cuda_stream_resident_expert &e = g_stream_resident_experts[i];
         if (cuda_stream_selected_is_current(e, layer, selected_ids, n_selected)) {
             continue;
         }
-        if (e.last_used < oldest) {
+        if (!plain && e.prot) {
+            if (e.last_used < oldest_prot) {
+                oldest_prot = e.last_used;
+                victim_prot = i;
+            }
+        } else if (e.last_used < oldest) {
             oldest = e.last_used;
             victim = i;
         }
     }
+    if (!plain && victim_prot != (size_t)-1 &&
+        (double)g_stream_resident_protected >
+            0.95 * (double)g_stream_resident_experts.size()) {
+        cuda_stream_resident_expert &d = g_stream_resident_experts[victim_prot];
+        d.prot = 0;
+        g_stream_resident_protected--;
+        d.last_used = ++g_stream_resident_clock;
+        if (victim == (size_t)-1) victim = victim_prot;
+        victim_prot = (size_t)-1;
+    }
+    if (victim == (size_t)-1) victim = victim_prot;
     if (victim == (size_t)-1) return 0;
     return cuda_stream_resident_evict_at(victim);
 }
@@ -1984,6 +2030,7 @@ static int cuda_stream_resident_alloc(
     e.bytes = bytes;
     e.last_used = ++g_stream_resident_clock;
     e.pooled = pooled;
+    e.prot = 0;
     g_stream_resident_experts.push_back(e);
     v41_pen_note(e.layer, e.expert, 1);
     g_stream_resident_index[cuda_stream_resident_entry_key(e)] =
@@ -4011,8 +4058,7 @@ static int cuda_stream_resident_seed_experts(
                                             gate_expert_bytes,
                                             down_expert_bytes);
         if (idx >= 0) {
-            g_stream_resident_experts[(size_t)idx].last_used =
-                ++g_stream_resident_clock;
+            cuda_stream_resident_touch(g_stream_resident_experts[(size_t)idx]);
             loaded++;
             continue;
         }
@@ -4184,7 +4230,7 @@ static int cuda_stream_selected_compact_mask(
         }
         cuda_stream_resident_expert &entry =
             g_stream_resident_experts[(size_t)idx];
-        entry.last_used = ++g_stream_resident_clock;
+        cuda_stream_resident_touch(entry);
         err = cudaMemcpyAsync(g_stream_selected_cache.gate +
                                   (uint64_t)i * gate_expert_bytes,
                               entry.gate,
@@ -4261,7 +4307,7 @@ static int cuda_stream_selected_prepare_ptrs(
         }
         cuda_stream_resident_expert &entry =
             g_stream_resident_experts[(size_t)idx];
-        entry.last_used = ++g_stream_resident_clock;
+        cuda_stream_resident_touch(entry);
         gate_ptrs[i] = entry.gate;
         up_ptrs[i] = entry.up;
         down_ptrs[i] = entry.down;
@@ -4557,7 +4603,7 @@ static int cuda_stream_batch_selected_prepare_from_host(
         if (idx >= 0) {
             cuda_stream_resident_expert &entry =
                 g_stream_resident_experts[(size_t)idx];
-            entry.last_used = ++g_stream_resident_clock;
+            cuda_stream_resident_touch(entry);
             gate_host[u] = entry.gate;
             up_host[u] = entry.up;
             down_host[u] = entry.down;
@@ -5207,8 +5253,7 @@ static int cuda_stream_layer_expert_cache_seed_selected(
                                             gate_expert_bytes,
                                             down_expert_bytes);
         if (idx >= 0) {
-            g_stream_resident_experts[(size_t)idx].last_used =
-                ++g_stream_resident_clock;
+            cuda_stream_resident_touch(g_stream_resident_experts[(size_t)idx]);
             continue;
         }
 
@@ -5424,8 +5469,7 @@ static int cuda_stream_selected_load(
             }
         }
         if (idx >= 0) {
-            g_stream_resident_experts[(size_t)idx].last_used =
-                ++g_stream_resident_clock;
+            cuda_stream_resident_touch(g_stream_resident_experts[(size_t)idx]);
             resident_mask |= 1u << i;
             continue;
         }
