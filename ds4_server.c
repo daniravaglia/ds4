@@ -11528,11 +11528,52 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
-                                  effective_prompt,
-                                  loaded_path_out,
-                                  loaded_ext_flags_out,
-                                  req && req->api == API_RESPONSES);
+    const char *text = req ? req->prompt_text : NULL;
+    char *canon = NULL;
+    /* Checkpoint keys are the text of the stored TOKENS. The request text can
+     * differ from the text of its own tokens: an alias such as "<|assistant|>"
+     * or "[gMASK]" inside a message tokenizes to a control token whose text is
+     * the canonical spelling. From that point on no checkpoint key is a byte
+     * prefix of the request text, and the lookup falls back to the last
+     * checkpoint stored before the alias (a 23.8K-token return after a side
+     * request restored 12.6K although 16.8K and 22.0K were on disk). So also
+     * look up by the text of the request's tokens and take the longer match.
+     * DS4_SERVER_KV_CANONICAL_KEY=0 restores the request-text-only lookup. */
+    static int canon_on = -1;
+    if (canon_on < 0) {
+        const char *v = getenv("DS4_SERVER_KV_CANONICAL_KEY");
+        canon_on = !(v && v[0] == '0');
+    }
+    if (canon_on && s && slot && text && req->prompt.len > 0 && req->image_count == 0) {
+        size_t canon_len = 0;
+        canon = render_tokens_text(s->engine, &req->prompt, &canon_len);
+        if (canon && canon_len == strlen(canon) && strcmp(canon, text)) {
+            const int model_id = ds4_engine_model_id(s->engine);
+            const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+            pthread_mutex_lock(&s->inference_mu);
+            const int ctx = ds4_session_ctx(slot->session);
+            pthread_mutex_lock(&s->kv_mu);
+            const int a = ds4_kvstore_find_text_prefix(&s->kv, text, model_id, quant_bits, ctx);
+            const uint64_t a_bytes = a >= 0 ? s->kv.entry[a].text_bytes : 0;
+            const int b = ds4_kvstore_find_text_prefix(&s->kv, canon, model_id, quant_bits, ctx);
+            const uint64_t b_bytes = b >= 0 ? s->kv.entry[b].text_bytes : 0;
+            pthread_mutex_unlock(&s->kv_mu);
+            pthread_mutex_unlock(&s->inference_mu);
+            if (b >= 0 && b_bytes > a_bytes) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: kv cache lookup by token text (%llu bytes; request text matched %llu)",
+                           (unsigned long long)b_bytes, (unsigned long long)a_bytes);
+                text = canon;
+            }
+        }
+    }
+    int loaded = kv_cache_try_load_text(s, slot, text,
+                                        effective_prompt,
+                                        loaded_path_out,
+                                        loaded_ext_flags_out,
+                                        req && req->api == API_RESPONSES);
+    free(canon);
+    return loaded;
 }
 
 /* A text-only suffix tokenizer would turn image markers into literal text.
