@@ -525,6 +525,24 @@ static bool kv_cache_incoming_supersedes_continued(
      * the reverse.  The incoming checkpoint dominates this one only if it is at
      * least as widely reusable. */
     if (incoming->ctx_size > e->ctx_size) return false;
+    /* Keep the continued checkpoints just behind the incoming one. The
+     * incoming checkpoint is only usable while the client's next prompt has it
+     * as an exact prefix, and that fails in practice: a checkpoint written when
+     * the live session is displaced ends in generated text the client may
+     * re-render, and one written at a prompt end includes the assistant header,
+     * whose tokens change when the thinking mode flips. Without a checkpoint
+     * shortly before it, the return to that conversation reprocesses everything
+     * after the system prompt. DS4_SERVER_KV_KEEP_LAST_CONTINUED=0 restores the
+     * old behavior (every continued prefix is superseded). */
+    if (incoming->tokens > 0 && e->tokens <= (uint32_t)incoming->tokens &&
+        (uint32_t)incoming->tokens - e->tokens <= 8192u) {
+        static int keep = -1;
+        if (keep < 0) {
+            const char *v = getenv("DS4_SERVER_KV_KEEP_LAST_CONTINUED");
+            keep = !(v && v[0] == '0');
+        }
+        if (keep) return false;
+    }
 
     char prefix_sha[41];
     ds4_kvstore_sha1_bytes_hex(incoming->text, (size_t)e->text_bytes,
@@ -1119,6 +1137,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
+        .reason = reason_code,
+        .tokens = store_tokens.len,
     };
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
 

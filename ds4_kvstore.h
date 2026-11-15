@@ -87,6 +87,8 @@ typedef struct {
     uint8_t quant_bits;
     uint32_t ctx_size;
     bool reject_different_quant;
+    uint8_t reason;   /* DS4_KVSTORE_REASON_* of the incoming checkpoint; 0 = not given */
+    int tokens;       /* its token count; 0 = not given */
 } ds4_kvstore_eviction_context;
 
 typedef struct {
