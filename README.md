@@ -59,8 +59,12 @@
 >   recent sessions and the checkpoints just behind a new one.
 > - **Fixes:** the shared expert was added twice in batched rows; partially staged
 >   layer slots could be reused by a later batch.
-> - **Opt-in, output-changing:** `DS4_V41_MISS_PENALTY=F` steers routing away from
->   experts that are not in memory (fewer SSD stalls).
+> - **Miss penalty** (`DS4_V41_MISS_PENALTY=0` disables; default 0.03): among
+>   near-tied experts the router prefers one that is already in memory, which
+>   avoids SSD stalls. It changes the output, so it was gated on teacher-forced
+>   perplexity over 16 texts (pooled +0.08 %, worse on 8 of 16: noise) and gives
+>   about +4.6 % decode on a replayed agent session. Set it to 0 for reproducible
+>   quality measurements; the benchmark table above was measured without it.
 >
 > A replay of that recorded session (336 requests) runs in 8,323 s on this commit
 > against 9,827 s before the last checkpoint fix. Tested and not adopted, because they

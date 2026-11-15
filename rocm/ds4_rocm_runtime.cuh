@@ -535,8 +535,9 @@ static int cuda_u64_mul3_checked(uint64_t a, uint64_t b, uint64_t c, uint64_t *o
     return cuda_u64_mul_checked(a, b, &tmp) && cuda_u64_mul_checked(tmp, c, out);
 }
 
-/* Experiment, off unless DS4_V41_MISS_PENALTY=F (changes the model's output
- * and makes it depend on the cache): subtract F from the router's SELECTION
+/* Miss penalty, default F = 0.03; DS4_V41_MISS_PENALTY=F sets it, 0 disables
+ * (it changes the model's output and makes it depend on the cache, so set 0
+ * for reproducible quality measurements): subtract F from the router's SELECTION
  * score of experts that are not resident, so that among near-tied candidates
  * a resident one is picked and the SSD read is avoided. The mixing weights
  * still come from the unpenalized probabilities of whatever is selected. Per
@@ -563,10 +564,10 @@ extern "C" int ds4_gpu_dsv41_route_penalty_begin(const void *model_map, uint64_t
         uint64_t bias_offset, uint32_t layer) {
     if (g_v41_pen_f < 0.0f) {
         const char *v = getenv("DS4_V41_MISS_PENALTY");
-        g_v41_pen_f = v && v[0] ? (float)atof(v) : 0.0f;
+        g_v41_pen_f = v && v[0] ? (float)atof(v) : 0.03f;
         if (g_v41_pen_f < 0.0f) g_v41_pen_f = 0.0f;
         if (g_v41_pen_f > 0.0f) {
-            fprintf(stderr, "ds4: V4.1 EXPERIMENT: miss penalty %.4f on the selection score of "
+            fprintf(stderr, "ds4: V4.1 miss penalty %.4f on the selection score of "
                     "non-resident experts\n", (double)g_v41_pen_f);
             memset(g_v41_pen_dirty, 1, sizeof(g_v41_pen_dirty));
         }

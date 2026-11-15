@@ -41629,7 +41629,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         /* router and expert fetch already issued pre-attention */
     } else {
 #ifdef DS4_ROCM_BUILD
-        /* Experiment (DS4_V41_MISS_PENALTY): see ds4_gpu_dsv41_route_penalty_begin. */
+        /* Miss penalty (DS4_V41_MISS_PENALTY): see ds4_gpu_dsv41_route_penalty_begin. */
         const int penalized = g->streaming && bias == l->ffn_exp_probs_b ?
             ds4_gpu_dsv41_route_penalty_begin(m->map, m->size, bias->abs_offset, il) : 0;
 #endif
