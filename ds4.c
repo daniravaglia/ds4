@@ -74670,8 +74670,57 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
 }
 #endif
 
+/* Experiment only (inert unless DS4_V41_DENSE_REQUANT_BITS=2..7 is set): round
+ * every device-cached Q8_0 matrix to a coarser per-block grid, still stored
+ * and run as Q8_0. It measures what a smaller dense format would cost in
+ * quality before any such format exists. DS4_V41_DENSE_REQUANT_MATCH=a,b
+ * limits it to tensors whose name contains one of the substrings. */
+static void ds41_dense_requant_experiment(ds4_engine *e) {
+#ifdef DS4_ROCM_BUILD
+    const char *bv = getenv("DS4_V41_DENSE_REQUANT_BITS");
+    if (!e || !bv || !bv[0]) return;
+    const int bits = !strcmp(bv, "f6") ? -6 : atoi(bv);   /* f6: 6-bit block float */
+    if (!((bits >= 2 && bits <= 7) || bits == -6)) return;
+    const char *match = getenv("DS4_V41_DENSE_REQUANT_MATCH");
+    const ds4_model *m = &e->model;
+    uint64_t done = 0, done_bytes = 0, skipped = 0, failed = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0 || t->type != DS4_TENSOR_Q8_0 || t->ndim != 2) continue;
+        char name[160];
+        snprintf(name, sizeof(name), "%.*s", (int)t->name.len, t->name.ptr);
+        bool want = !(match && match[0]);
+        for (const char *q = match; !want && q && *q; ) {
+            const char *c = strchr(q, ',');
+            const size_t n = c ? (size_t)(c - q) : strlen(q);
+            char part[96];
+            if (n > 0 && n < sizeof(part)) {
+                memcpy(part, q, n); part[n] = 0;
+                if (strstr(name, part)) want = true;
+            }
+            q = c ? c + 1 : NULL;
+        }
+        if (!want) { skipped++; continue; }
+        if (ds4_gpu_debug_requant_q8_range(m->map, t->abs_offset, t->bytes, bits)) {
+            done++; done_bytes += t->bytes;
+        } else {
+            failed++;
+            if (failed <= 8) fprintf(stderr, "ds4: dense requant: %s not rewritten\n", name);
+        }
+    }
+    (void)ds4_gpu_debug_requant_q8_range(m->map, 0, 0, bits);
+    fprintf(stderr, "ds4: EXPERIMENT dense Q8 weights rounded to %d bits: %llu tensors, %.2f GiB "
+            "(%llu not matched, %llu not rewritten)\n", bits, (unsigned long long)done,
+            (double)done_bytes / 1073741824.0, (unsigned long long)skipped, (unsigned long long)failed);
+#else
+    (void)e;
+#endif
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
-    return ds4_engine_open_internal(out, opt, NULL);
+    const int rc = ds4_engine_open_internal(out, opt, NULL);
+    if (rc == 0 && out) ds41_dense_requant_experiment(*out);
+    return rc;
 }
 
 int ds4_engine_create_with_gpu_config(ds4_engine **out,

@@ -467,6 +467,7 @@ int ds4_gpu_stream_expert_cache_note_layer_consumed(
 int ds4_gpu_stream_expert_cache_quiesce(void);
 /* DS4_ROCM_STREAM_ACCESS_LOG diagnostics (ROCm only; see rocm/ds4_rocm_runtime.cuh). */
 int ds4_gpu_stream_access_log_on(void);
+int ds4_gpu_debug_requant_q8_range(const void *model_map, uint64_t offset, uint64_t bytes, int bits);
 void ds4_gpu_stream_access_note_prefill(uint32_t layer, uint32_t pos, const int32_t *selected,
                                         uint32_t rows, uint32_t per_row, int last);
 int ds4_gpu_stream_expert_cache_get_memory(ds4_gpu_stream_expert_memory *out);
