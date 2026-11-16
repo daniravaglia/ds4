@@ -3324,6 +3324,120 @@ template<int Waves> __global__ void moe_v41_down_wave_ptrs6_kernel(
     if (!lane) out[row] = total;
 }
 
+/* Small batches whose rows must match the one-token decode arithmetic
+ * (prompt-lookup verification). Gate/up by unique expert: blockIdx.y is a
+ * compact expert slot and the block serves every (token, slot) pair routed to
+ * it, each with exactly the lane math, reduction, clamp and SwiGLU of
+ * moe_v41_gate_up_wave_ptrs_kernel; the weights of an expert are read from
+ * memory once and from cache for its further pairs. */
+template<int Waves, uint32_t MAXP> __global__ void moe_v41_gate_up_wave_unique_ptrs_kernel(
+        float *mid_out, const char *const *gt, const char *const *ut,
+        const cuda_block_q8_K *xq, const int32_t *selected, const float *weights,
+        uint64_t rb, uint32_t B, uint32_t M, uint32_t n_expert, uint32_t n_pairs, float clamp,
+        const uint8_t *pair_missing, uint32_t want_missing) {
+    __shared__ uint32_t pairs[MAXP];
+    __shared__ uint32_t npairs;
+    const uint32_t u = blockIdx.y;
+    if (threadIdx.x == 0) {
+        uint32_t n = 0;
+        for (uint32_t p = 0; p < n_pairs && n < MAXP; p++) {
+            int32_t si = selected[p];
+            if (si < 0) si = 0;
+            if ((uint32_t)si == u &&
+                (!pair_missing || (uint32_t)(pair_missing[p] != 0u) == want_missing)) pairs[n++] = p;
+        }
+        npairs = n;
+    }
+    __syncthreads();
+    const uint32_t np = npairs;
+    const unsigned lane = threadIdx.x & 31, row = blockIdx.x * Waves + (threadIdx.x >> 5);
+    if (!np || row >= M) return;
+    const char *gb = gt[u];
+    const char *ub = ut[u];
+    if (!gb || !ub) return;
+    auto *g = (const cuda_block_iq2_xxs *) (gb + row * rb);
+    auto *w = (const cuda_block_iq2_xxs *) (ub + row * rb);
+    /* v41_iq2_pair32 with its weight decode hoisted out of the pair loop: the
+     * integer dots are exact and each pair keeps the float expression and the
+     * block order of the one-token kernel. */
+    const cuda_block_q8_K *xp[MAXP];
+    float gv[MAXP], uv[MAXP];
+#pragma unroll
+    for (uint32_t q = 0; q < MAXP; q++) {
+        xp[q] = xq + (uint64_t)(pairs[q < np ? q : 0] / n_expert) * B;
+        gv[q] = 0; uv[q] = 0;
+    }
+    const int sub = lane & 7;
+    for (unsigned b = lane >> 3; b < B; b += 4) {
+        int32_t gw[8], uw[8];
+        const uint16_t *gq = (g + b)->qs + 4 * sub, *uq = (w + b)->qs + 4 * sub;
+        const uint32_t ga = (uint32_t) gq[0] | ((uint32_t) gq[1] << 16), gb2 = (uint32_t) gq[2] | ((uint32_t) gq[3] << 16);
+        const uint32_t ua = (uint32_t) uq[0] | ((uint32_t) uq[1] << 16), ub2 = (uint32_t) uq[2] | ((uint32_t) uq[3] << 16);
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const uint64_t gg = cuda_iq2xxs_grid[(ga >> (8 * j)) & 255], ug = cuda_iq2xxs_grid[(ua >> (8 * j)) & 255];
+            const uint2 gm = dev_iq2_sign_masks[(gb2 >> (7 * j)) & 0x7fu], um = dev_iq2_sign_masks[(ub2 >> (7 * j)) & 0x7fu];
+            gw[2 * j] = __vsub4((int32_t)(uint32_t)gg ^ (int32_t)gm.x, (int32_t)gm.x);
+            gw[2 * j + 1] = __vsub4((int32_t)(uint32_t)(gg >> 32) ^ (int32_t)gm.y, (int32_t)gm.y);
+            uw[2 * j] = __vsub4((int32_t)(uint32_t)ug ^ (int32_t)um.x, (int32_t)um.x);
+            uw[2 * j + 1] = __vsub4((int32_t)(uint32_t)(ug >> 32) ^ (int32_t)um.y, (int32_t)um.y);
+        }
+        const int gls = 2 * (gb2 >> 28) + 1, uls = 2 * (ub2 >> 28) + 1;
+        const float gd = dev_f16_to_f32((g + b)->d), ud = dev_f16_to_f32((w + b)->d);
+#pragma unroll
+        for (uint32_t q = 0; q < MAXP; q++) {
+            if (q >= np) break;
+            const cuda_block_q8_K *x = xp[q] + b;
+            const int32_t *y = (const int32_t *)(x->qs + sub * 32);
+            int gs = 0, us = 0;
+#pragma unroll
+            for (int j = 0; j < 8; j++) { gs = __dp4a(gw[j], y[j], gs); us = __dp4a(uw[j], y[j], us); }
+            gs *= gls; us *= uls;
+            gv[q] += .125f * gd * x->d * (float) gs;
+            uv[q] += .125f * ud * x->d * (float) us;
+        }
+    }
+#pragma unroll
+    for (uint32_t q = 0; q < MAXP; q++) {
+        if (q >= np) break;
+        float gt2 = gv[q], ut2 = uv[q];
+        for (int off = 16; off; off >>= 1) {
+            gt2 += __shfl_down(gt2, off, 32);
+            ut2 += __shfl_down(ut2, off, 32);
+        }
+        if (!lane) {
+            if (clamp > 1e-6f) {
+                gt2 = fminf(gt2, clamp);
+                ut2 = fmaxf(-clamp, fminf(ut2, clamp));
+            }
+            const uint32_t p = pairs[q];
+            mid_out[(uint64_t)p * M + row] = (gt2 / (1 + expf(-gt2))) * ut2 * weights[p];
+        }
+    }
+}
+
+/* Down projection for those batches: blockIdx.y is the token; per token the
+ * slot order, lane math and reduction of moe_v41_down_wave_ptrs_kernel. */
+template<int Waves> __global__ void moe_v41_down_wave_ptrs_batch_kernel(
+        float *out, const char *const *table, const cuda_block_q8_K *xq, const int32_t *ids,
+        uint64_t rb, unsigned B, unsigned M, unsigned N) {
+    unsigned lane = threadIdx.x & 31, row = blockIdx.x * Waves + (threadIdx.x >> 5);
+    const unsigned tok = blockIdx.y;
+    if (row >= M) return;
+    float total = 0;
+    for (unsigned slot = 0; slot < N; slot++) {
+        int id = ids[(uint64_t)tok * N + slot];
+        if (id < 0) id = 0;
+        const char *base = table[id];
+        if (!base) continue;
+        auto *w = (const cuda_block_q2_K *) (base + row * rb);
+        auto *x = xq + ((uint64_t)tok * N + slot) * B;
+        for (unsigned b = lane >> 3; b < B; b += 4) total += v41_q2_part32(w + b, x + b, lane & 7);
+    }
+    total = warp_sum_f32(total);
+    if (!lane) out[(uint64_t)tok * M + row] = total;
+}
+
 /* Decode occupancy selectors. The wave count changes only how many rows one
  * block owns; per-row lane math and reduction order are unchanged. */
 static int ds4_rocm_v41_wave_env(const char *name) {

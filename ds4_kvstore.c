@@ -30,6 +30,8 @@
  * file version because the KVC envelope can remain stable while the serialized
  * ds4_session internals become unsafe to restore across runtime changes. */
 #define KV_CACHE_PAYLOAD_ABI 2u
+#define KV_CACHE_RECENCY_WEIGHT 4.0
+#define KV_CACHE_RECENCY_HALF_LIFE_SECONDS (30ull * 60ull)
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
 #define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
 /* Tokenizers may merge text across the prompt boundary. Trimming a small tail
@@ -185,6 +187,7 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
 const char *ds4_kvstore_key_kind(uint8_t ext_flags) {
     if (ext_flags & DS4_KVSTORE_EXT_RESPONSES_VISIBLE) return "responses-visible";
     if (ext_flags & DS4_KVSTORE_EXT_THINKING_VISIBLE) return "thinking-visible";
+    if (ext_flags & DS4_KVSTORE_EXT_VISION_KEY) return "token-text-images";
     return "token-text";
 }
 
@@ -522,6 +525,24 @@ static bool kv_cache_incoming_supersedes_continued(
      * the reverse.  The incoming checkpoint dominates this one only if it is at
      * least as widely reusable. */
     if (incoming->ctx_size > e->ctx_size) return false;
+    /* Keep the continued checkpoints just behind the incoming one. The
+     * incoming checkpoint is only usable while the client's next prompt has it
+     * as an exact prefix, and that fails in practice: a checkpoint written when
+     * the live session is displaced ends in generated text the client may
+     * re-render, and one written at a prompt end includes the assistant header,
+     * whose tokens change when the thinking mode flips. Without a checkpoint
+     * shortly before it, the return to that conversation reprocesses everything
+     * after the system prompt. DS4_SERVER_KV_KEEP_LAST_CONTINUED=0 restores the
+     * old behavior (every continued prefix is superseded). */
+    if (incoming->tokens > 0 && e->tokens <= (uint32_t)incoming->tokens &&
+        (uint32_t)incoming->tokens - e->tokens <= 8192u) {
+        static int keep = -1;
+        if (keep < 0) {
+            const char *v = getenv("DS4_SERVER_KV_KEEP_LAST_CONTINUED");
+            keep = !(v && v[0] == '0');
+        }
+        if (keep) return false;
+    }
 
     char prefix_sha[41];
     ds4_kvstore_sha1_bytes_hex(incoming->text, (size_t)e->text_bytes,
@@ -551,7 +572,18 @@ double ds4_kvstore_entry_eviction_score(
         effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
     }
-    double score = (effective_hits + 1.0) *
+    /* Recency: a checkpoint that was just stored or used is the most likely
+     * to be needed again (agent side requests and subagents alternate with
+     * the main session within minutes). Without this term every unused
+     * entry scored the same tokens/byte, so a fresh small checkpoint was
+     * evicted by the next large store while hours-old ones survived. */
+    double recency = 0.0;
+    if (used_at != 0) {
+        const double age = now > used_at ? (double)(now - used_at) : 0.0;
+        recency = KV_CACHE_RECENCY_WEIGHT *
+                  exp2(-age / (double)KV_CACHE_RECENCY_HALF_LIFE_SECONDS);
+    }
+    double score = (effective_hits + 1.0 + recency) *
                    (double)e->tokens / (double)e->file_size;
     if (kv_cache_reason_is_anchor(e->reason))
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
@@ -665,6 +697,48 @@ char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
         char *piece = ds4_token_text(engine, tokens->v[i], &len);
         kv_buf_append(&b, piece, len);
         free(piece);
+    }
+    if (out_len) *out_len = b.len;
+    return kv_buf_take(&b);
+}
+
+char *ds4_kvstore_render_vision_key(ds4_engine *engine, const ds4_tokens *tokens, int len,
+                                    const uint32_t *starts, const uint32_t *counts,
+                                    const uint8_t (*fps)[32], size_t n, size_t *out_len) {
+    if (!tokens || len < 0 || len > tokens->len || (n && (!starts || !counts || !fps)))
+        return NULL;
+    static const char hex[] = "0123456789abcdef";
+    kv_buf b = {0};
+    size_t img = 0;
+    for (int i = 0; i < len;) {
+        if (img < n && (uint32_t)i == starts[img]) {
+            if ((uint64_t)starts[img] + counts[img] > (uint64_t)len) {
+                free(kv_buf_take(&b));
+                return NULL;
+            }
+            char mark[96];
+            size_t m = 0;
+            mark[m++] = '\036';
+            mark[m++] = 'I'; mark[m++] = 'M'; mark[m++] = 'G';
+            for (int k = 0; k < 32; k++) {
+                mark[m++] = hex[fps[img][k] >> 4];
+                mark[m++] = hex[fps[img][k] & 15];
+            }
+            m += (size_t)snprintf(mark + m, sizeof(mark) - m, ":%u\037", counts[img]);
+            kv_buf_append(&b, mark, m);
+            i += (int)counts[img];
+            img++;
+            continue;
+        }
+        if (img < n && (uint32_t)i > starts[img]) {   /* unsorted or overlapping spans */
+            free(kv_buf_take(&b));
+            return NULL;
+        }
+        size_t plen = 0;
+        char *piece = ds4_token_text(engine, tokens->v[i], &plen);
+        kv_buf_append(&b, piece, plen);
+        free(piece);
+        i++;
     }
     if (out_len) *out_len = b.len;
     return kv_buf_take(&b);
@@ -1063,6 +1137,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
+        .reason = reason_code,
+        .tokens = store_tokens.len,
     };
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
 

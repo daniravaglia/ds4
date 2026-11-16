@@ -273,6 +273,81 @@ extern "C" int ds4_gpu_dsv41_hc_tail(ds4_gpu_tensor *split_out, const ds4_gpu_te
     return cuda_ok(cudaGetLastError(), "V4.1 fused HC tail");
 }
 
+/* One-token decode: the HC mixer of a sublayer (RMS norm of the 4 x 5120
+ * residual, the 20480 -> 24 projection, Sinkhorn) is only consumed by the
+ * expand at the END of that sublayer. Run it on a non-blocking side stream so
+ * it overlaps the sublayer's large kernels instead of sitting in front of
+ * them; the main stream keeps only the weighted sum + norm it needs at once.
+ * Same kernels and arithmetic as the fused tail; events order the two
+ * streams (side waits for the residual, the expand waits for the mixer).
+ * DS4_ROCM_V41_HC_SIDE_STREAM=0 disables. */
+__global__ static void v41_hc_ordered_prefetch_kernel(float *out,
+        const __half *weights, const float *input);
+__global__ static void v41_hc_split_one_kernel(float *split_out, const float *mix,
+        const float *hscale, const float *hbase, uint32_t sinkhorn_iters, float hc_eps) {
+    if (threadIdx.x == 0u) hc4_split_one(split_out, mix, hscale, hbase, sinkhorn_iters, hc_eps);
+}
+static cudaStream_t g_v41_hc_side_stream;
+static cudaEvent_t g_v41_hc_side_ready, g_v41_hc_side_done;
+static int g_v41_hc_side_pending;
+extern "C" int ds4_gpu_dsv41_hc_mix_side_join(void) {
+    if (!g_v41_hc_side_pending) return 1;
+    g_v41_hc_side_pending = 0;
+    return cuda_ok(hipStreamWaitEvent((hipStream_t)0, g_v41_hc_side_done, 0), "V4.1 HC side join");
+}
+/* Returns 1 started, 0 not applicable (caller uses the fused tail), -1 error. */
+extern "C" int ds4_gpu_dsv41_hc_mix_side(ds4_gpu_tensor *split_out, ds4_gpu_tensor *mix,
+        ds4_gpu_tensor *flat_norm, const ds4_gpu_tensor *residual,
+        const void *model_map, uint64_t model_size, uint64_t fn_offset,
+        uint64_t scale_offset, uint64_t base_offset, uint32_t sinkhorn_iters,
+        float hc_eps, float rms_eps) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_HC_SIDE_STREAM");
+        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
+    }
+    const uint64_t fn_bytes = UINT64_C(20480) * 24u * sizeof(uint16_t);
+    if (!on || g_quality_mode || !split_out || !mix || !flat_norm || !residual || !model_map ||
+        !cuda_tensor_has_bytes(mix, 24u * 4u) || !cuda_tensor_has_bytes(split_out, 24u * 4u) ||
+        !cuda_tensor_has_f32(residual, 4u * 5120u) || !cuda_tensor_has_f32(flat_norm, 4u * 5120u) ||
+        !cuda_model_range_fits(model_size, fn_offset, fn_bytes) ||
+        !cuda_model_range_fits(model_size, scale_offset, 3u * 4u) ||
+        !cuda_model_range_fits(model_size, base_offset, 24u * 4u) ||
+        !rms_norm_batched_on() || cuda_runtime_config()->graph_dump) return 0;
+    const __half *w = (const __half *)cuda_model_range_ptr(model_map, fn_offset, fn_bytes, "V4.1 tiny HC F16");
+    const float *hs = (const float *)cuda_model_range_ptr(model_map, scale_offset, 12u, "hc_scale");
+    const float *hb = (const float *)cuda_model_range_ptr(model_map, base_offset, 96u, "hc_base");
+    if (!w || !hs || !hb || ((uintptr_t)w % alignof(__half2)) != 0u ||
+        ((uintptr_t)flat_norm->ptr % alignof(float2)) != 0u) return 0;
+    if (!g_v41_hc_side_stream) {
+        if (hipStreamCreateWithFlags(&g_v41_hc_side_stream, cudaStreamNonBlocking) != hipSuccess ||
+            cudaEventCreateWithFlags(&g_v41_hc_side_ready, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&g_v41_hc_side_done, cudaEventDisableTiming) != cudaSuccess) {
+            (void)cudaGetLastError();
+            g_v41_hc_side_stream = NULL;
+            on = 0;
+            return 0;
+        }
+        fprintf(stderr, "ds4: ROCm V4.1 HC mixer on a side stream\n");
+    }
+    /* A previous mixer nobody joined must not be overtaken. */
+    if (g_v41_hc_side_pending && !ds4_gpu_dsv41_hc_mix_side_join()) return -1;
+    if (!cuda_ok(cudaEventRecord(g_v41_hc_side_ready, 0), "V4.1 HC side dependency record") ||
+        !cuda_ok(hipStreamWaitEvent(g_v41_hc_side_stream, g_v41_hc_side_ready, 0), "V4.1 HC side dependency wait"))
+        return -1;
+    rms_norm_batched_kernel<false><<<1, 256, 0, g_v41_hc_side_stream>>>((float *)flat_norm->ptr,
+        (const float *)residual->ptr, NULL, 4u * 5120u, 1, rms_eps);
+    v41_hc_ordered_prefetch_kernel<<<dim3(24u, 1u), 32u, 0, g_v41_hc_side_stream>>>(
+        (float *)mix->ptr, w, (const float *)flat_norm->ptr);
+    v41_hc_split_one_kernel<<<1, 32, 0, g_v41_hc_side_stream>>>((float *)split_out->ptr,
+        (const float *)mix->ptr, hs, hb, sinkhorn_iters, hc_eps);
+    if (!cuda_ok(cudaGetLastError(), "V4.1 HC side launch") ||
+        !cuda_ok(cudaEventRecord(g_v41_hc_side_done, g_v41_hc_side_stream), "V4.1 HC side done record"))
+        return -1;
+    g_v41_hc_side_pending = 1;
+    return 1;
+}
+
 struct v41_rope_args {
     uint32_t width, heads, start, stride, inverse;
     float frequencies[32];
@@ -1451,6 +1526,160 @@ __global__ static void v41_hc_ordered_prefetch_kernel(float *out,
     }
 }
 
+/* Engram projection (F16 6144 -> 25600) from an exact E4M3 copy.
+ *
+ * Every 32x32 block of the two Engram projection matrices is an E4M3 value
+ * times a power of two (they were FP8 before the GGUF upcast), checked at
+ * build time block by block. The copy holds one byte per weight plus one
+ * exponent per block, so a decode token reads 2 x 157 MB instead of
+ * 2 x 315 MB. The kernel keeps the shared-X single-row kernel's lane order
+ * (lane l: elements l + 32 j, eight per 256-wide step, then the warp sum)
+ * and widens each byte to the same float the F16 weight gives, so results
+ * are bit-identical (checked against the F16 kernel on both matrices). Single
+ * rows only: at 4-6 rows the F16 tile kernel is faster. DS4_ROCM_V41_ENGRAM_E4M3=0
+ * disables. */
+__device__ static inline float v41_e4m3_decode(uint32_t b) {
+    const int e = (int)((b >> 3) & 15u), m = (int)(b & 7u);
+    const float v = e ? ldexpf((float)(8 + m), e - 10) : ldexpf((float)m, -9);
+    return (b & 128u) ? -v : v;
+}
+/* Branch-light widening: normal codes map to float bits directly, the
+ * seven subnormal codes (and zero) are m * 2^-9. Same values as the table. */
+__device__ static inline float v41_e4m3_bits(uint32_t b) {
+    const uint32_t e = (b >> 3) & 15u, m = b & 7u;
+    const float normal = __uint_as_float(((b & 128u) << 24) | ((e + 120u) << 23) | (m << 20));
+    const float sub = __uint_as_float((b & 128u) << 24 | 0x3b000000u) * (float)m; /* +-2^-9 * m */
+    return e ? normal : sub;
+}
+/* One 32x32 block per 256-thread workgroup. */
+__global__ static void v41_engram_e4m3_build_kernel(uint8_t *q, int8_t *exps,
+        const __half *w, uint32_t *inexact) {
+    constexpr uint32_t K = 6144u;
+    const uint32_t bc = blockIdx.x, br = blockIdx.y, tid = threadIdx.x;
+    __shared__ float smax[256];
+    float vals[4];
+    float mx = 0.0f;
+#pragma unroll
+    for (uint32_t u = 0; u < 4u; u++) {
+        const uint32_t idx = tid + u * 256u, r = idx >> 5, c = idx & 31u;
+        vals[u] = __half2float(w[(uint64_t)(br * 32u + r) * K + bc * 32u + c]);
+        mx = fmaxf(mx, fabsf(vals[u]));
+    }
+    smax[tid] = mx;
+    __syncthreads();
+    for (uint32_t st = 128u; st; st >>= 1) {
+        if (tid < st) smax[tid] = fmaxf(smax[tid], smax[tid + st]);
+        __syncthreads();
+    }
+    mx = smax[0];
+    int se = 0;
+    if (mx > 0.0f) {
+        int e2; (void)frexpf(mx / 448.0f, &e2);   /* mx/448 = f * 2^e2, f in [0.5, 1) */
+        se = e2;                                   /* 2^se >= mx/448 */
+        if (ldexpf(1.0f, se - 1) >= mx / 448.0f) se--;
+    }
+    if (tid == 0) exps[br * (K / 32u) + bc] = (int8_t)se;
+    if (se < -120 || se > 120) { atomicOr(inexact, 1u); return; }
+#pragma unroll
+    for (uint32_t u = 0; u < 4u; u++) {
+        const uint32_t idx = tid + u * 256u, r = idx >> 5, c = idx & 31u;
+        const float v = ldexpf(vals[u], -se), a = fabsf(v);
+        uint32_t b = 0;
+        if (a != 0.0f) {
+            int e2; const float f = frexpf(a, &e2);      /* a = f * 2^e2 */
+            const int be = e2 - 1 + 7;
+            if (be >= 1) {
+                const float mant = (2.0f * f - 1.0f) * 8.0f;
+                b = ((uint32_t)be << 3) | (uint32_t)fminf(fmaxf(mant, 0.0f), 7.0f);
+                if (be > 15) b = 0x7fu;
+            } else {
+                b = (uint32_t)fminf(a * 512.0f, 7.0f);
+            }
+        }
+        if (signbit(v)) b |= 128u;
+        if (v41_e4m3_decode(b) != v || (b & 0x7fu) == 0x7fu) atomicOr(inexact, 1u);
+        q[(uint64_t)(br * 32u + r) * K + bc * 32u + c] = (uint8_t)b;
+    }
+}
+struct v41_engram_e4m3 { const uint8_t *q; const int8_t *exps; };
+static v41_engram_e4m3 v41_engram_e4m3_weights(const void *model_map, uint64_t weight_offset,
+                                                const __half *w) {
+    struct entry { const void *map; uint64_t offset; uint8_t *q; int8_t *e; int state; };
+    static entry cache[4];
+    for (uint32_t i = 0; i < 4u; i++) {
+        entry *c = &cache[i];
+        if (c->state && c->map == model_map && c->offset == weight_offset)
+            return c->state == 1 ? v41_engram_e4m3{c->q, c->e} : v41_engram_e4m3{NULL, NULL};
+        if (c->state) continue;
+        c->map = model_map; c->offset = weight_offset; c->state = 2;
+        const uint64_t n = 6144ull * 25600ull, nb = (6144ull / 32u) * (25600ull / 32u);
+        uint32_t *flag = NULL, inexact = 0;
+        if (!cuda_ok(cudaMalloc(&c->q, n), "V4.1 Engram E4M3 weights") ||
+            !cuda_ok(cudaMalloc(&c->e, nb), "V4.1 Engram E4M3 exponents") ||
+            !cuda_ok(cudaMalloc(&flag, sizeof(uint32_t)), "V4.1 Engram E4M3 check") ||
+            !cuda_ok(cudaMemcpy(flag, &inexact, sizeof(inexact), cudaMemcpyHostToDevice), "V4.1 Engram E4M3 reset")) {
+            (void)cudaGetLastError();
+        } else {
+            v41_engram_e4m3_build_kernel<<<dim3(6144u / 32u, 25600u / 32u), 256u>>>(c->q, c->e, w, flag);
+            if (cuda_ok(cudaGetLastError(), "V4.1 Engram E4M3 build") &&
+                cuda_ok(cudaMemcpy(&inexact, flag, sizeof(inexact), cudaMemcpyDeviceToHost), "V4.1 Engram E4M3 read") &&
+                !inexact) c->state = 1;
+        }
+        if (flag) (void)cudaFree(flag);
+        if (c->state != 1) {
+            if (c->q) (void)cudaFree(c->q);
+            if (c->e) (void)cudaFree(c->e);
+            c->q = NULL; c->e = NULL;
+            fprintf(stderr, "ds4: V4.1 Engram weights at %llu are not exact E4M3 blocks; keeping F16\n",
+                    (unsigned long long)weight_offset);
+            return v41_engram_e4m3{NULL, NULL};
+        }
+        fprintf(stderr, "ds4: V4.1 Engram projection reads an exact E4M3 copy (%.0f MB)\n",
+                (double)(n + nb) / 1e6);
+        return v41_engram_e4m3{c->q, c->e};
+    }
+    return v41_engram_e4m3{NULL, NULL};
+}
+/* Same lane order and FMA chain as matmul_f16_f32_sharedx_warp_rows_w32_kernel. */
+__global__ static void __launch_bounds__(1024) v41_engram_e4m3_row_kernel(float *out,
+        const uint8_t *q, const int8_t *exps, const float *x) {
+    constexpr uint32_t K = 6144u;
+    extern __shared__ float shx[];
+    __shared__ float scale[K / 32u];
+    const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5u;
+    for (uint32_t i = tid; i < K; i += 1024u) shx[i] = x[i];
+    /* All 32 rows of this workgroup lie in one 32-row block. */
+    if (tid < K / 32u) scale[tid] = ldexpf(1.0f, exps[blockIdx.x * (K / 32u) + tid]);
+    __syncthreads();
+    const uint64_t row = (uint64_t)blockIdx.x * 32u + wave;
+    const uint8_t *wr = q + row * K;
+    float acc = 0.0f;
+    for (uint32_t i = lane; i + 224u < K; i += 256u) {
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            const uint32_t k = i + 32u * j;
+            const float wv = __fmul_rn(v41_e4m3_bits(wr[k]), scale[k >> 5]);
+            acc = __fmaf_rn(wv, shx[k], acc);   /* the F16 kernel's contracted FMA */
+        }
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+static bool v41_engram_e4m3_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_ENGRAM_E4M3");
+        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
+    }
+    return on != 0;
+}
+
+/* Rows the tiny-row kernels serve: six for prefill batches, sixteen while a
+ * speculative verify runs (prefill tail chunks of 7-16 rows keep their
+ * established kernels, so prefill results do not change). */
+static inline uint32_t v41_tiny_rows_max(void) {
+    return g_dspark_verify_mode ? 16u : 6u;
+}
 extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                              uint64_t weight_offset, uint32_t width, uint32_t outputs,
                                              uint32_t rows, const ds4_gpu_tensor *in) {
@@ -1459,6 +1688,18 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
         !cuda_u64_mul3_checked(width, outputs, sizeof(uint16_t), &weight_bytes) ||
         !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
         !cuda_tensor_has_elems2(in, width, rows, 4u) || !cuda_tensor_has_elems2(out, outputs, rows, 4u)) return 0;
+    if (width == 6144u && outputs == 25600u && rows == 1u && v41_engram_e4m3_on() &&
+        !g_quality_mode && !cuda_runtime_config()->graph_dump) {
+        const __half *w = (const __half *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes, "V4.1 exact Engram F16");
+        if (!w) return 0;
+        const v41_engram_e4m3 e4 = v41_engram_e4m3_weights(model_map, weight_offset, w);
+        if (e4.q) {
+            v41_engram_e4m3_row_kernel<<<25600u / 32u, 1024u, 6144u * sizeof(float)>>>(
+                (float *)out->ptr, e4.q, e4.exps, (const float *)in->ptr);
+            return cuda_ok(cudaGetLastError(), "V4.1 Engram E4M3 projection");
+        }
+    }
     if (width == 6144u && outputs == 25600u && rows >= 2u && rows <= 6u &&
         ds4_rocm_is_gfx1151() && !cuda_runtime_config()->graph_dump) {
         const __half *w = (const __half *)cuda_model_range_ptr(
@@ -1477,6 +1718,21 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
             (float *)out->ptr, w, (const float *)in->ptr); break;
         }
         return cuda_ok(cudaGetLastError(), "V4.1 exact tiny-row Engram projection");
+    }
+    if (width == 6144u && outputs == 25600u && rows > 6u && rows <= v41_tiny_rows_max() &&
+        ds4_rocm_is_gfx1151() && !cuda_runtime_config()->graph_dump) {
+        /* Seven to sixteen rows: the tiny-row kernels in chunks (rows are
+         * independent; only the weight read repeats per chunk). */
+        for (uint32_t off = 0; off < rows;) {
+            uint32_t n = rows - off;
+            if (n > 6u) n = n == 7u ? 5u : 6u;   /* never leave a single row */
+            ds4_gpu_tensor x = {(float *)in->ptr + (uint64_t)off * width, (uint64_t)n * width * 4u, 0};
+            ds4_gpu_tensor y = {(float *)out->ptr + (uint64_t)off * outputs, (uint64_t)n * outputs * 4u, 0};
+            if (!ds4_gpu_dsv41_projection_rows(&y, model_map, model_size, weight_offset,
+                                               width, outputs, n, &x)) return 0;
+            off += n;
+        }
+        return 1;
     }
     if (width == 6144u && outputs == 25600u && rows >= 32u && rows <= 2048u &&
         ds4_rocm_is_gfx1151() && !g_quality_mode && !cuda_runtime_config()->graph_dump) {
@@ -1516,6 +1772,7 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
         /* Partial batches retain the existing per-row F32-input fallback. */
     }
     if (width == 20480u && outputs == 24u && rows >= 8u && rows <= 2048u &&
+        !(g_v41_decode_like_batch && rows <= 16u) &&   /* wide verifies: the tiny-row kernel below */
         ds4_rocm_is_gfx1151()) {
         const __half *w = (const __half *)cuda_model_range_ptr(
             model_map, weight_offset, weight_bytes, "f16");
@@ -1567,7 +1824,7 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
             return cuda_ok(cudaGetLastError(), "V4.1 F16 indexer query-B token-reuse projection");
         }
     }
-    if (width == 20480u && outputs == 24u && rows <= 6u &&
+    if (width == 20480u && outputs == 24u && rows <= v41_tiny_rows_max() &&
         ds4_rocm_is_gfx1151()) {
         const __half *w = (const __half *)cuda_model_range_ptr(
             model_map, weight_offset, weight_bytes, "V4.1 tiny HC F16");
@@ -1593,11 +1850,17 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
     return 1;
 }
 
+static const uint16_t *v41_router_bf16_weights(const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t width, uint32_t outputs);
 /* Keep the scalar 256-lane reduction tree. Reuse weights across tiny rows
  * and replace its final five block barriers with the same warp additions. */
-template <uint32_t TOKENS>
-__global__ static void v41_router_f32_rows_kernel(float *out, const float *weights,
+template <uint32_t TOKENS, bool BF16W = false>
+__global__ static void v41_router_f32_rows_kernel(float *out, const void *weights_any,
         const float *input, uint32_t outputs, uint32_t rows) {
+    /* BF16W: the weights are the exact BF16 copy of the F32 matrix (half the
+     * bytes to read); widening them back gives the same floats. */
+    const float *weights = (const float *)weights_any;
+    const uint16_t *weights16 = (const uint16_t *)weights_any;
     constexpr uint32_t width = 5120u;
     const uint32_t lane = threadIdx.x, row = blockIdx.x;
     float sum[TOKENS] = {};
@@ -1606,7 +1869,9 @@ __global__ static void v41_router_f32_rows_kernel(float *out, const float *weigh
 #pragma unroll
         for (uint32_t u = 0; u < 4u; u++) {
             const uint32_t col = lane + (base + u) * 256u;
-            w[u] = weights[(uint64_t)row * width + col];
+            w[u] = BF16W ?
+                __uint_as_float((uint32_t)weights16[(uint64_t)row * width + col] << 16) :
+                weights[(uint64_t)row * width + col];
 #pragma unroll
             for (uint32_t t = 0; t < TOKENS; t++)
                 x[t][u] = t < rows ? input[(uint64_t)t * width + col] : 0.0f;
@@ -1645,7 +1910,7 @@ extern "C" int ds4_gpu_dsv41_f32_projection_rows(ds4_gpu_tensor *out,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
         uint32_t width, uint32_t outputs, uint32_t rows, const ds4_gpu_tensor *in) {
     uint64_t weight_bytes = 0;
-    if (!width || !outputs || !rows || rows > 6u || !model_map ||
+    if (!width || !outputs || !rows || rows > v41_tiny_rows_max() || !model_map ||
         !cuda_u64_mul3_checked(width, outputs, sizeof(float), &weight_bytes) ||
         !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
         !cuda_tensor_has_elems2(in, width, rows, 4u) ||
@@ -1653,6 +1918,29 @@ extern "C" int ds4_gpu_dsv41_f32_projection_rows(ds4_gpu_tensor *out,
     const float *w = (const float *)cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "V4.1 tiny F32 projection");
     if (!w) return 0;
+    if (ds4_rocm_is_gfx1151() && width == 5120u && outputs == 384u && !g_quality_mode) {
+        /* Router: read the exact BF16 copy of the weights (bit-identical
+         * results, half the bytes). DS4_ROCM_V41_ROUTER_BF16_DECODE=0 restores. */
+        static int bf16_on = -1;
+        if (bf16_on < 0) {
+            const char *v = getenv("DS4_ROCM_V41_ROUTER_BF16_DECODE");
+            bf16_on = !(v && v[0] == '0');
+        }
+        const uint16_t *w16 = bf16_on ?
+            v41_router_bf16_weights(model_map, model_size, weight_offset, width, outputs) : NULL;
+        if (w16) {
+#define V41_ROUTER_ROWS16(T) v41_router_f32_rows_kernel<T, true><<<outputs, 256u>>>( \
+        (float *)out->ptr, w16, (const float *)in->ptr, outputs, rows)
+            if (rows == 1u) { V41_ROUTER_ROWS16(1u); }
+            else if (rows == 2u) { V41_ROUTER_ROWS16(2u); }
+            else if (rows == 3u) { V41_ROUTER_ROWS16(3u); }
+            else if (rows <= 6u) { V41_ROUTER_ROWS16(6u); }
+            else if (rows <= 12u) { V41_ROUTER_ROWS16(12u); }
+            else { V41_ROUTER_ROWS16(16u); }
+#undef V41_ROUTER_ROWS16
+            return cuda_ok(cudaGetLastError(), "V4.1 tiny BF16 router projection");
+        }
+    }
     if (ds4_rocm_is_gfx1151() && width == 5120u &&
         (outputs == 128u || outputs == 384u)) {
 #define V41_ROUTER_ROWS(T) v41_router_f32_rows_kernel<T><<<outputs, 256u>>>( \
@@ -1660,7 +1948,9 @@ extern "C" int ds4_gpu_dsv41_f32_projection_rows(ds4_gpu_tensor *out,
         if (rows == 1u) { V41_ROUTER_ROWS(1u); }
         else if (rows == 2u) { V41_ROUTER_ROWS(2u); }
         else if (rows == 3u) { V41_ROUTER_ROWS(3u); }
-        else { V41_ROUTER_ROWS(6u); }
+        else if (rows <= 6u) { V41_ROUTER_ROWS(6u); }
+        else if (rows <= 12u) { V41_ROUTER_ROWS(12u); }
+        else { V41_ROUTER_ROWS(16u); }
 #undef V41_ROUTER_ROWS
         return cuda_ok(cudaGetLastError(), "V4.1 tiny F32 router projection");
     }
@@ -1878,6 +2168,26 @@ static int v41_q8_f32_tiny_rows_launch(float *out, const unsigned char *weights,
             out, weights, input, width, rows_per_group, row_bytes); break;
         case 6u: v41_q8_f32_tiny_rows_kernel<6u, GROUPS><<<outputs, 32u>>>(
             out, weights, input, width, rows_per_group, row_bytes); break;
+        case 7u: v41_q8_f32_tiny_rows_kernel<7u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 8u: v41_q8_f32_tiny_rows_kernel<8u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 9u: v41_q8_f32_tiny_rows_kernel<9u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 10u: v41_q8_f32_tiny_rows_kernel<10u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 11u: v41_q8_f32_tiny_rows_kernel<11u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 12u: v41_q8_f32_tiny_rows_kernel<12u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 13u: v41_q8_f32_tiny_rows_kernel<13u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 14u: v41_q8_f32_tiny_rows_kernel<14u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 15u: v41_q8_f32_tiny_rows_kernel<15u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
+        case 16u: v41_q8_f32_tiny_rows_kernel<16u, GROUPS><<<outputs, 32u>>>(
+            out, weights, input, width, rows_per_group, row_bytes); break;
         default: return 0;
     }
     return cuda_ok(cudaGetLastError(), "V4.1 tiny-row Q8 projection");
@@ -2062,20 +2372,12 @@ __global__ static void v41_f32_to_bf16_exact_kernel(uint16_t *out, const float *
     out[i] = (uint16_t)(bits >> 16);
     if (bits & 0xffffu) atomicOr(inexact, 1u);
 }
-extern "C" int ds4_gpu_dsv41_router_bf16_rows(ds4_gpu_tensor *out, const void *model_map,
-        uint64_t model_size, uint64_t weight_offset, uint32_t width, uint32_t outputs,
-        uint32_t rows, const ds4_gpu_tensor *in) {
-    static int on = -1;
-    if (on < 0) {
-        const char *v = getenv("DS4_ROCM_V41_ROUTER_BF16");
-        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
-    }
-    if (!on || g_quality_mode || rows < 16u || rows > 2048u || outputs != 384u || width != 5120u ||
-        !model_map || !cuda_tensor_has_elems2(in, width, rows, 4u) ||
-        !cuda_tensor_has_elems2(out, outputs, rows, 4u) ||
-        ((uintptr_t)in->ptr % 16u) != 0u) return 0;
+/* Exact BF16 copy of a router matrix (made once per layer and kept), or NULL
+ * when the matrix is not BF16 values. */
+static const uint16_t *v41_router_bf16_weights(const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t width, uint32_t outputs) {
     const uint64_t n = (uint64_t)outputs * width;
-    if (!cuda_model_range_fits(model_size, weight_offset, n * sizeof(float))) return 0;
+    if (!cuda_model_range_fits(model_size, weight_offset, n * sizeof(float))) return NULL;
     struct entry { const void *map; uint64_t offset; uint16_t *w; int state; };
     static entry cache[64];
     entry *e = NULL;
@@ -2084,15 +2386,15 @@ extern "C" int ds4_gpu_dsv41_router_bf16_rows(ds4_gpu_tensor *out, const void *m
         if (!cache[i].state) {
             const float *w32 = (const float *)cuda_model_range_ptr(model_map, weight_offset,
                 n * sizeof(float), "V4.1 router F32");
-            if (!w32) return 0;
+            if (!w32) return NULL;
             uint16_t *w16 = NULL; uint32_t *flag = NULL;
             if (!cuda_ok(cudaMalloc(&w16, n * sizeof(uint16_t)), "V4.1 router BF16 weights") ||
-                !cuda_ok(cudaMalloc(&flag, sizeof(uint32_t)), "V4.1 router BF16 check")) return 0;
+                !cuda_ok(cudaMalloc(&flag, sizeof(uint32_t)), "V4.1 router BF16 check")) return NULL;
             uint32_t inexact = 0;
-            if (!cuda_ok(cudaMemcpy(flag, &inexact, sizeof(inexact), cudaMemcpyHostToDevice), "V4.1 router BF16 check reset")) return 0;
+            if (!cuda_ok(cudaMemcpy(flag, &inexact, sizeof(inexact), cudaMemcpyHostToDevice), "V4.1 router BF16 check reset")) return NULL;
             v41_f32_to_bf16_exact_kernel<<<(unsigned)((n + 255u) / 256u), 256u>>>(w16, w32, n, flag);
             if (!cuda_ok(cudaGetLastError(), "V4.1 router BF16 convert") ||
-                !cuda_ok(cudaMemcpy(&inexact, flag, sizeof(inexact), cudaMemcpyDeviceToHost), "V4.1 router BF16 check read")) return 0;
+                !cuda_ok(cudaMemcpy(&inexact, flag, sizeof(inexact), cudaMemcpyDeviceToHost), "V4.1 router BF16 check read")) return NULL;
             (void)cudaFree(flag);
             cache[i].map = model_map; cache[i].offset = weight_offset;
             if (inexact) {
@@ -2108,8 +2410,23 @@ extern "C" int ds4_gpu_dsv41_router_bf16_rows(ds4_gpu_tensor *out, const void *m
             break;
         }
     }
-    if (!e || e->state != 1 || ((uintptr_t)e->w % 16u) != 0u) return 0;
-    if (ds41_v41_matmul_bf16(e->w, (const float *)in->ptr, (float *)out->ptr, outputs, width, rows)) return 0;
+    return e && e->state == 1 ? e->w : NULL;
+}
+extern "C" int ds4_gpu_dsv41_router_bf16_rows(ds4_gpu_tensor *out, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t width, uint32_t outputs,
+        uint32_t rows, const ds4_gpu_tensor *in) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_ROCM_V41_ROUTER_BF16");
+        on = !(v && v[0] == '0') && ds4_rocm_is_gfx1151();
+    }
+    if (!on || g_quality_mode || rows < 16u || rows > 2048u || outputs != 384u || width != 5120u ||
+        !model_map || !cuda_tensor_has_elems2(in, width, rows, 4u) ||
+        !cuda_tensor_has_elems2(out, outputs, rows, 4u) ||
+        ((uintptr_t)in->ptr % 16u) != 0u) return 0;
+    const uint16_t *w16 = v41_router_bf16_weights(model_map, model_size, weight_offset, width, outputs);
+    if (!w16 || ((uintptr_t)w16 % 16u) != 0u) return 0;
+    if (ds41_v41_matmul_bf16(w16, (const float *)in->ptr, (float *)out->ptr, outputs, width, rows)) return 0;
     static int logged = 0;
     if (!logged) { logged = 1; fprintf(stderr, "ds4: ROCm V4.1 router on BF16 matrix cores active (rows=%u)\n", rows); }
     return 1;
@@ -2219,7 +2536,7 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
         v41_q8_f32_blocks4_kernel<<<(outputs + 7u) / 8u, 256u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
             width, outputs, (uint64_t)(width / 32u) * 34u);
-    } else if (rows <= 6u && ds4_rocm_is_gfx1151()) {
+    } else if (rows <= v41_tiny_rows_max() && ds4_rocm_is_gfx1151()) {
         return v41_q8_f32_tiny_rows_launch<1u>((float *)out->ptr, weights,
             (const float *)in->ptr, width, outputs, rows,
             (uint64_t)(width / 32u) * 34u);
@@ -2478,7 +2795,7 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
     const unsigned char *a = (const unsigned char *)cuda_model_range_ptr(model_map, out_a_offset, a_bytes, "V4.1 attn_out_a");
     const unsigned char *b = (const unsigned char *)cuda_model_range_ptr(model_map, out_b_offset, b_bytes, "V4.1 attn_out_b");
     if (!a || !b) return 0;
-    if (n_tokens >= 2u && n_tokens <= 6u && ds4_rocm_is_gfx1151()) {
+    if (n_tokens >= 2u && n_tokens <= v41_tiny_rows_max() && ds4_rocm_is_gfx1151()) {
         if (!v41_q8_f32_tiny_rows_launch<8u>((float *)low->ptr, a,
                 (const float *)heads->ptr, 4096u, 1024u, n_tokens,
                 UINT64_C(128) * 34u) ||

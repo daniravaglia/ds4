@@ -11265,6 +11265,52 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
     };
 }
 
+#define KV_EXT_VISION_KEY DS4_KVSTORE_EXT_VISION_KEY
+enum { KV_VISION_KEY_MAX_IMAGES = 64 };
+
+/* DS4_SERVER_IMAGE_DISK_KV=0 restores "no disk checkpoints for sessions
+ * with images". */
+static bool server_image_disk_kv_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_SERVER_IMAGE_DISK_KV");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+}
+
+/* Key text for the live session's first store_len tokens with its images'
+ * fingerprints; NULL while a multimodal sync is running or if an image
+ * straddles store_len (caller holds inference_mu). */
+static char *kv_vision_key_session(server *s, server_slot *slot,
+                                   const ds4_tokens *tokens, int store_len) {
+    uint32_t starts[KV_VISION_KEY_MAX_IMAGES], counts[KV_VISION_KEY_MAX_IMAGES];
+    uint8_t fps[KV_VISION_KEY_MAX_IMAGES][32];
+    const size_t n = ds4_session_vision_identities(slot->session, starts, counts, fps,
+                                                   KV_VISION_KEY_MAX_IMAGES);
+    if (n == SIZE_MAX || n > KV_VISION_KEY_MAX_IMAGES) return NULL;
+    size_t use = 0;
+    while (use < n && starts[use] < (uint32_t)store_len) use++;
+    return ds4_kvstore_render_vision_key(s->engine, tokens, store_len,
+                                         starts, counts, (const uint8_t (*)[32])fps,
+                                         use, NULL);
+}
+
+/* The same key for a request's whole prompt. */
+static char *kv_vision_key_request(server *s, const request *req) {
+    if (!req || !req->image_count || req->image_count > KV_VISION_KEY_MAX_IMAGES) return NULL;
+    uint32_t starts[KV_VISION_KEY_MAX_IMAGES], counts[KV_VISION_KEY_MAX_IMAGES];
+    uint8_t fps[KV_VISION_KEY_MAX_IMAGES][32];
+    for (size_t i = 0; i < req->image_count; i++) {
+        starts[i] = req->images[i].token_start;
+        counts[i] = req->images[i].embedding.token_count;
+        memcpy(fps[i], req->images[i].embedding.fingerprint, 32);
+    }
+    return ds4_kvstore_render_vision_key(s->engine, &req->prompt, req->prompt.len,
+                                         starts, counts, (const uint8_t (*)[32])fps,
+                                         req->image_count, NULL);
+}
+
 static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const ds4_tokens *tokens,
                                             int store_len, const char *reason,
@@ -11280,9 +11326,20 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
      * placeholder tokens become a cache hit for a different image.
      * sync_image_count covers progress-callback writes during prefill;
      * checkpoint_image_count covers completed sessions. */
+    char *vision_key = NULL;
     if (ds4_session_has_vision_state(slot->session)) {
-        pthread_mutex_unlock(&s->inference_mu);
-        return false;
+        /* Image sessions are stored under a key that carries every image's
+         * fingerprint (kv_vision_key_session); visible-text keys and stores
+         * during a multimodal prefill stay refused. */
+        if (!cache_text_override && server_image_disk_kv_on())
+            vision_key = kv_vision_key_session(s, slot, tokens, store_len);
+        if (!vision_key) {
+            pthread_mutex_unlock(&s->inference_mu);
+            return false;
+        }
+        cache_text_override = vision_key;
+        cache_text_ext = KV_EXT_VISION_KEY;
+        cache_text_key = "token-text-images";
     }
     pthread_mutex_lock(&s->kv_mu);
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
@@ -11294,6 +11351,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   &hooks, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
+    free(vision_key);
     return ok;
 }
 
@@ -11470,11 +11528,52 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
-                                  effective_prompt,
-                                  loaded_path_out,
-                                  loaded_ext_flags_out,
-                                  req && req->api == API_RESPONSES);
+    const char *text = req ? req->prompt_text : NULL;
+    char *canon = NULL;
+    /* Checkpoint keys are the text of the stored TOKENS. The request text can
+     * differ from the text of its own tokens: an alias such as "<|assistant|>"
+     * or "[gMASK]" inside a message tokenizes to a control token whose text is
+     * the canonical spelling. From that point on no checkpoint key is a byte
+     * prefix of the request text, and the lookup falls back to the last
+     * checkpoint stored before the alias (a 23.8K-token return after a side
+     * request restored 12.6K although 16.8K and 22.0K were on disk). So also
+     * look up by the text of the request's tokens and take the longer match.
+     * DS4_SERVER_KV_CANONICAL_KEY=0 restores the request-text-only lookup. */
+    static int canon_on = -1;
+    if (canon_on < 0) {
+        const char *v = getenv("DS4_SERVER_KV_CANONICAL_KEY");
+        canon_on = !(v && v[0] == '0');
+    }
+    if (canon_on && s && slot && text && req->prompt.len > 0 && req->image_count == 0) {
+        size_t canon_len = 0;
+        canon = render_tokens_text(s->engine, &req->prompt, &canon_len);
+        if (canon && canon_len == strlen(canon) && strcmp(canon, text)) {
+            const int model_id = ds4_engine_model_id(s->engine);
+            const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+            pthread_mutex_lock(&s->inference_mu);
+            const int ctx = ds4_session_ctx(slot->session);
+            pthread_mutex_lock(&s->kv_mu);
+            const int a = ds4_kvstore_find_text_prefix(&s->kv, text, model_id, quant_bits, ctx);
+            const uint64_t a_bytes = a >= 0 ? s->kv.entry[a].text_bytes : 0;
+            const int b = ds4_kvstore_find_text_prefix(&s->kv, canon, model_id, quant_bits, ctx);
+            const uint64_t b_bytes = b >= 0 ? s->kv.entry[b].text_bytes : 0;
+            pthread_mutex_unlock(&s->kv_mu);
+            pthread_mutex_unlock(&s->inference_mu);
+            if (b >= 0 && b_bytes > a_bytes) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: kv cache lookup by token text (%llu bytes; request text matched %llu)",
+                           (unsigned long long)b_bytes, (unsigned long long)a_bytes);
+                text = canon;
+            }
+        }
+    }
+    int loaded = kv_cache_try_load_text(s, slot, text,
+                                        effective_prompt,
+                                        loaded_path_out,
+                                        loaded_ext_flags_out,
+                                        req && req->api == API_RESPONSES);
+    free(canon);
+    return loaded;
 }
 
 /* A text-only suffix tokenizer would turn image markers into literal text.
@@ -11621,6 +11720,7 @@ static bool live_text_prefix_offset(const request *req, const char *ptext, size_
 
 static int live_prefix_rewind_target(bool backend_can_rewind,
                                      int old_pos, int prompt_len, int common);
+static bool server_snapshot_rewind_on(void);
 
 typedef enum {
     REUSE_NONE = 0,
@@ -11730,6 +11830,20 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         pr.kind = REUSE_MEMORY_REWIND;
         pr.reuse_tokens = rewind_to;
         return pr;
+    }
+    /* V4.1 keeps in-memory snapshots of its small attention state. When the
+     * prompt leaves the live session (re-rendered last turn, thinking flip,
+     * rewritten tool call), continue from the nearest snapshot at or before
+     * the common prefix instead of rebuilding everything. Image identity is
+     * re-checked after the rewind. */
+    if (common < live_pos && server_snapshot_rewind_on()) {
+        const int limit = common < req->prompt.len ? common : req->prompt.len - 1;
+        const int point = limit > 0 ? ds4_session_rewind_point(slot->session, limit) : -1;
+        if (point > 0) {
+            pr.kind = REUSE_MEMORY_REWIND;
+            pr.reuse_tokens = point;
+            return pr;
+        }
     }
     if (common == live_pos && req->prompt.len >= live_pos && token_image_prefix) {
         pr.kind = REUSE_MEMORY_TOKEN;
@@ -13462,6 +13576,39 @@ static void *decode_worker_main(void *arg) {
     return NULL;
 }
 
+/* DS4_SERVER_IMAGE_PREFIX_KV=0 restores full reprocessing of image sessions
+ * after a live-cache miss. */
+static bool server_image_prefix_kv_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_SERVER_IMAGE_PREFIX_KV");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+}
+
+/* Anchor checkpoints for cold prompts longer than cold_max (default on;
+ * DS4_SERVER_LONG_COLD_ANCHOR=0 restores the old limit). */
+static bool server_long_cold_anchor_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_SERVER_LONG_COLD_ANCHOR");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+}
+
+/* V4.1 in-memory snapshot rewind on live-cache divergence (default on;
+ * DS4_SERVER_SNAPSHOT_REWIND=0 restores the full rebuild). */
+static bool server_snapshot_rewind_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_SERVER_SNAPSHOT_REWIND");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -13593,25 +13740,37 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * and the vision state must still describe the request (upstream's
          * multimodal hardening).  A failed validation falls through to the
          * disk cache / cold prefill instead of reusing a bad frontier. */
+        const bool snapshot_rewind = ds4_engine_is_deepseek41(s->engine);
         const bool rewind_valid =
+            ds4_session_checkpoint_valid(slot->session) &&
             ds4_session_common_prefix(slot->session, &j->req.prompt) ==
                 reuse.reuse_tokens &&
             (!multimodal ||
-             ds4_session_vision_state_matches(slot->session,
-                                              j->req.images,
-                                              j->req.image_count));
+             (snapshot_rewind ?
+              ds4_session_vision_prefix_matches(slot->session,
+                                                j->req.images,
+                                                j->req.image_count) :
+              ds4_session_vision_state_matches(slot->session,
+                                               j->req.images,
+                                               j->req.image_count)));
         pthread_mutex_unlock(&s->inference_mu);
         if (rewind_valid) {
             live_materialized = true;
             cache_source = "memory-rewind";
             cache_diag.rewind_to = reuse.reuse_tokens;
-            server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                       old_pos, reuse.reuse_tokens);
+            if (snapshot_rewind)
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: live snapshot rewind from %d to %d (common=%d prompt=%d), replaying %d tokens",
+                           old_pos, reuse.reuse_tokens, common, j->req.prompt.len,
+                           j->req.prompt.len - reuse.reuse_tokens);
+            else
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
+                           old_pos, reuse.reuse_tokens);
         } else {
             cached = 0;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
+                       "ds4-server: live prefix rewind from %d to %d requires rebuild",
                        old_pos, reuse.reuse_tokens);
         }
         break;
@@ -13676,12 +13835,53 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    if (!multimodal && s->kv.enabled && cached == 0 &&
+    bool evict_stored = false;
+    if ((!multimodal || server_image_disk_kv_on()) && s->kv.enabled && cached == 0 &&
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, slot, "evict");
+        evict_stored = true;
+    }
+    /* Image sessions: look up the longest checkpoint whose key (tokens plus
+     * image fingerprints) is a prefix of this request's key. The restored
+     * tokens must be an exact prefix of the request and no image may cross
+     * the restore point; the restored images are then adopted as the
+     * session's vision state. */
+    if (multimodal && cached == 0 && s->kv.enabled && !responses_protocol &&
+        server_image_disk_kv_on()) {
+        char *key = kv_vision_key_request(s, &j->req);
+        if (key) {
+            ds4_tokens scratch = {0};
+            uint8_t ext = 0;
+            int loaded = kv_cache_try_load_text(s, slot, key, &scratch,
+                                                &disk_cache_path, &ext, false);
+            ds4_tokens_free(&scratch);
+            free(key);
+            if (loaded > 0) {
+                pthread_mutex_lock(&s->inference_mu);
+                const int pos = ds4_session_pos(slot->session);
+                const bool usable =
+                    pos > 0 && pos < j->req.prompt.len &&
+                    ds4_session_common_prefix(slot->session, &j->req.prompt) == pos &&
+                    ds4_session_adopt_vision_identities(slot->session, j->req.images,
+                                                        j->req.image_count);
+                if (!usable) ds4_session_invalidate(slot->session);
+                pthread_mutex_unlock(&s->inference_mu);
+                if (usable) {
+                    cached = disk_cached = pos;
+                    cache_source = "disk-image-key";
+                } else {
+                    free(disk_cache_path);
+                    disk_cache_path = NULL;
+                }
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: multimodal image checkpoint %s tokens=%d images=%zu prompt=%d",
+                           usable ? "restored" : "rejected (token or image mismatch)",
+                           pos, j->req.image_count, j->req.prompt.len);
+            }
+        }
     }
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
@@ -13691,6 +13891,51 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
+        }
+    }
+    /* Sessions with images have no disk checkpoints (the files carry no
+     * image identity), so a live miss used to reprocess the whole prompt.
+     * The text before the first image is an ordinary text prefix: restore
+     * the longest checkpoint inside it and let the multimodal sync continue
+     * from there. The restored tokens must be an exact prefix of this
+     * request's tokens, else the session is dropped as before. */
+    if (multimodal && cached == 0 && s->kv.enabled && !responses_protocol &&
+        j->req.prompt_text && j->req.image_markers && j->req.images &&
+        server_image_prefix_kv_on() &&
+        (int)j->req.images[0].token_start >= s->kv.opt.min_tokens)
+    {
+        const char *marker = strstr(j->req.prompt_text, j->req.image_markers[0]);
+        if (marker) {
+            if (!evict_stored && old_pos >= s->kv.opt.min_tokens)
+                kv_cache_store_current(s, slot, "evict");
+            char *text_prefix = xstrndup(j->req.prompt_text,
+                                         (size_t)(marker - j->req.prompt_text));
+            ds4_tokens scratch = {0};
+            uint8_t ext = 0;
+            int loaded = kv_cache_try_load_text(s, slot, text_prefix, &scratch,
+                                                &disk_cache_path, &ext, false);
+            ds4_tokens_free(&scratch);
+            free(text_prefix);
+            if (loaded > 0) {
+                pthread_mutex_lock(&s->inference_mu);
+                const int pos = ds4_session_pos(slot->session);
+                const bool usable =
+                    pos > 0 && pos <= (int)j->req.images[0].token_start &&
+                    ds4_session_common_prefix(slot->session, &j->req.prompt) == pos;
+                if (!usable) ds4_session_invalidate(slot->session);
+                pthread_mutex_unlock(&s->inference_mu);
+                if (usable) {
+                    cached = disk_cached = pos;
+                    cache_source = "disk-text-prefix";
+                } else {
+                    free(disk_cache_path);
+                    disk_cache_path = NULL;
+                }
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: multimodal text-prefix checkpoint %s tokens=%d first_image=%u prompt=%d",
+                           usable ? "restored" : "rejected (token mismatch)",
+                           pos, j->req.images[0].token_start, j->req.prompt.len);
+            }
         }
     }
     const bool responses_reasoning_state_preserved =
@@ -13782,14 +14027,36 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!multimodal && cached == 0 &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0 &&
-        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
+        s->kv.opt.cold_max_tokens > 0)
     {
+        /* Long cold prompts (OMP compaction summaries are 40-70K tokens) still
+         * store their stable chat prefix when that prefix fits cold_max:
+         * consecutive compactions share their first 4-5K tokens. */
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
                                                     ds4_token_user(s->engine),
                                                     ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        if (prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
+            cold_store_len = anchor >= s->kv.opt.min_tokens ?
+                             anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        else if (anchor >= s->kv.opt.min_tokens && anchor <= s->kv.opt.cold_max_tokens &&
+                 server_long_cold_anchor_on())
+            cold_store_len = anchor;
+    }
+    if (multimodal && cached == 0 && s->kv.enabled && !responses_protocol &&
+        j->req.images && server_image_prefix_kv_on() &&
+        (int)j->req.images[0].token_start >= s->kv.opt.min_tokens)
+    {
+        /* Store the stable chat prefix (everything before the first user
+         * message) when it lies before the first image: the next compacted
+         * or restarted image session restores it instead of recomputing. */
+        ds4_tokens view = *prompt_for_sync;
+        view.len = (int)j->req.images[0].token_start;
+        const int anchor = kv_cache_chat_anchor_pos(&s->kv, &view,
+                                                    ds4_token_user(s->engine),
+                                                    ds4_token_assistant(s->engine));
+        if (anchor >= s->kv.opt.min_tokens &&
+            (s->kv.opt.cold_max_tokens <= 0 || anchor <= s->kv.opt.cold_max_tokens))
+            cold_store_len = anchor;
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -13877,7 +14144,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    if (!multimodal || server_image_disk_kv_on()) kv_cache_maybe_store_continued(s, slot);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -14016,7 +14283,7 @@ decode_again:
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+            if (!multimodal || server_image_disk_kv_on()) kv_cache_maybe_store_continued(s, slot);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -14061,8 +14328,28 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
+        /* Prompt-lookup drafts (text repeated from the context) are verified
+         * several tokens at a time. Not while tool-call syntax is forced
+         * greedy or client stop strings could end the reply inside a block:
+         * a V4.1 session cannot rewind cheaply. */
+        /* Tool-call syntax is decoded greedily and is nearly the same text in
+         * every call (about 60 tokens per call in a recorded agent session,
+         * 13 % of all generated tokens): lookup may draft it one tag at a
+         * time (DS4_V41_LOOKUP_SYNTAX=0 keeps it token by token). */
+        static int lookup_syntax_on = -1;
+        if (lookup_syntax_on < 0) {
+            const char *v = getenv("DS4_V41_LOOKUP_SYNTAX");
+            lookup_syntax_on = !(v && v[0] == '0');
+        }
+        const bool lookup_base = !s->batched_mode &&
+            !j->req.ignore_eos && j->req.stops.len == 0;
+        const bool lookup_syntax = lookup_base && greedy_tool_syntax && lookup_syntax_on;
+        const bool lookup_ok = lookup_base && (!greedy_tool_syntax || lookup_syntax);
+        const bool lookup = lookup_ok && ds4_session_lookup_available(slot->session);
+        ds4_session_set_lookup(slot->session, lookup_ok);
+        ds4_session_set_lookup_syntax(slot->session, lookup_syntax);
         if (!s->batched_mode &&
-            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+            (ds4_engine_mtp_draft_tokens(s->engine) > 1 || lookup) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
             if (j->req.ignore_eos) {
@@ -22300,9 +22587,20 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     double f_on = kv_entry_eviction_score(&fresh, NULL, now, NULL);
     TEST_ASSERT(s_on < f_on);
 
-    /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
-     * regardless of how old another entry's hit history is. */
-    TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
+    /* A just-stored entry scores (0 hits + 1 + full recency bonus) per
+     * token/byte, regardless of how old another entry's hit history is. */
+    TEST_ASSERT(f_on == 5.0 * (double)fresh.tokens / (double)fresh.file_size);
+}
+
+static void test_kv_cache_eviction_keeps_fresh_small_checkpoint(void) {
+    /* Agent pattern of 2026-11-13: a subagent's 8K-token checkpoint was
+     * evicted by the next main-session store while hours-old, never-used
+     * 90K-token checkpoints with a slightly better tokens/byte survived. */
+    const uint64_t now = 100000u;
+    kv_entry old_big = {.tokens = 90000, .hits = 0, .file_size = 560000, .last_used = now - 3u * 3600u};
+    kv_entry fresh_small = {.tokens = 8000, .hits = 0, .file_size = 59000, .last_used = now - 60u};
+    TEST_ASSERT(kv_entry_eviction_score(&old_big, NULL, now, NULL) <
+                kv_entry_eviction_score(&fresh_small, NULL, now, NULL));
 }
 
 static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
@@ -23207,6 +23505,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
+    test_kv_cache_eviction_keeps_fresh_small_checkpoint();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }

@@ -475,6 +475,10 @@ size_t ds4_session_image_token_ranges(const ds4_session *s, uint32_t *starts,
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+size_t ds4_session_vision_identities(const ds4_session *s, uint32_t *starts,
+                                     uint32_t *counts, uint8_t (*fps)[32], size_t cap);
+bool ds4_session_adopt_vision_identities(ds4_session *s, const ds4_vision_span *spans,
+                                         size_t n);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
@@ -595,6 +599,9 @@ void ds4_session_invalidate(ds4_session *s);
  * the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
+/* Largest in-memory rewind point <= max_pos that ds4_session_rewind() can
+ * restore without a rebuild (V4.1 snapshots), or -1. */
+int ds4_session_rewind_point(ds4_session *s, int max_pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
@@ -604,6 +611,9 @@ bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 bool ds4_engine_mtp_exact_sampling(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
+bool ds4_session_lookup_available(ds4_session *s);
+void ds4_session_set_lookup(ds4_session *s, bool allowed);
+void ds4_session_set_lookup_syntax(ds4_session *s, bool syntax);
 
 /* Low-level graph slice entry points used by distributed inference.  The
  * transport/session routing logic lives in ds4_distributed.c. */

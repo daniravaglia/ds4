@@ -40397,7 +40397,12 @@ static uint32_t ds41_engram_host_capacity(uint32_t prefill, uint32_t carry) {
 /* DSpark drafting keeps the target-layer main features and the projected
  * per-stage KV state in 128-row rings.  A verification pass snapshots the
  * resident trunk state that it may overwrite and restores its rejected tail. */
+/* Rows one V4.1 step batch (speculative verify, short prefill) can carry.
+ * The two-machine protocol keeps its own DS4_TP_BATCH_MAX_ROWS. */
+#define DS41_STEP_BATCH_MAX_ROWS 16
 #define DS41_DRAFT_WINDOW 128u
+struct ds41_lk_index;
+static void ds41_lk_index_free(struct ds41_lk_index *ix);
 typedef struct {
     const ds4_dspark_weights *w;
     const ds4_model *m;
@@ -40405,6 +40410,19 @@ typedef struct {
     uint32_t targets[DS4_DSPARK_MAX_TARGET_LAYERS];
     uint32_t mh_pos0, mh_rows, verify_rows;
     uint32_t skip_left, policy_cycles, policy_drafted, policy_accepted;
+    /* Prompt lookup: where in the history the copy being followed continues,
+     * and how many single-token steps have passed without a draft. */
+    uint32_t lk_cursor, lk_idle, lk_streak;
+    bool lk_valid;
+    /* Cost-aware lookup policy (see ds41_lookup_width): running costs of a
+     * one-token step and of one verified row, and per match-length bucket the
+     * decayed drafted / accepted token counts and skipped opportunities. */
+    uint32_t lk_run;                 /* consecutive fully accepted drafts */
+    float lk_plain_ms, lk_row_ms;
+    float lk_acc[6], lk_drafted[6];
+    uint32_t lk_skipped[6];
+    uint64_t lk_stat_cycles, lk_stat_drafted, lk_stat_accepted, lk_stat_skipped;
+    struct ds41_lk_index *lk_index;  /* n-gram continuation counts of the session's tokens */
     ds4_gpu_tensor *mh, *pending, *ring, *raw, *conf_proj, *markov_head_t;
     ds4_gpu_tensor *tokens, *conf, *parts, *logits, *x, *xn;
     ds4_gpu_tensor *saved, *pool_kv, *pool_score;
@@ -40421,6 +40439,7 @@ static void ds41_draft_free(ds41_draft *d) {
     };
     for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++)
         ds4_gpu_tensor_free(tensors[i]);
+    ds41_lk_index_free(d->lk_index);
     free(d);
 }
 
@@ -40436,6 +40455,11 @@ static void ds41_draft_reset(ds41_draft *d) {
     d->policy_cycles = 0;
     d->policy_drafted = 0;
     d->policy_accepted = 0;
+    d->lk_cursor = 0;
+    d->lk_idle = 0;
+    d->lk_streak = 0;
+    d->lk_run = 0;
+    d->lk_valid = false;
 }
 
 typedef struct {
@@ -40470,6 +40494,9 @@ typedef struct {
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
     ds41_draft *draft;
+    /* Prompt-lookup verification state (no drafter). Installed as `draft`
+     * only for the duration of one verify + rollback. */
+    ds41_draft *lookup;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -40530,6 +40557,7 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
 #endif
     ds4_gpu_tensor_free(g->prefill_tokens);
     ds41_draft_free(g->draft);
+    ds41_draft_free(g->lookup);
     memset(g, 0, sizeof(*g));
     g->table[0].fd = g->table[1].fd = -1;
 }
@@ -40635,6 +40663,7 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->valid = true;
     ds4_engram_history_reset(&g->history);
     ds41_draft_reset(g->draft);
+    ds41_draft_reset(g->lookup);
     /* Valid lengths, not zeroed storage, determine cache visibility. Each
      * partial pair is overwritten by its even-position token before use. */
 }
@@ -40861,13 +40890,16 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }
 
+/* A speculative verify of up to sixteen rows is running (set around it). */
+static bool g_ds41_wide_verify;
 static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
     const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
     bool ok;
 #ifdef DS4_ROCM_BUILD
-    if (weight->type == DS4_TENSOR_F32 && count >= 2u && count <= 6u) {
+    if (weight->type == DS4_TENSOR_F32 && count >= 2u &&
+        count <= (g_ds41_wide_verify ? 16u : 6u)) {
         ok = ds4_gpu_dsv41_f32_projection_rows(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
         return ok && (!round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));
@@ -41075,6 +41107,7 @@ static bool ds41_hc_expand_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *block
                                 const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
                                 ds4_gpu_tensor *copy4) {
 #ifdef DS4_ROCM_BUILD
+    if (!ds4_gpu_dsv41_hc_mix_side_join()) return false;
     if (ds41_norm_fuse_on())
         return ds4_gpu_hc_expand_split_bf16_tensor((ds4_gpu_tensor *)out, block, residual,
             split, DS4_N_EMBD, DS4_N_HC, copy4) != 0;
@@ -41140,6 +41173,19 @@ static bool ds41_hc_mix_norm(ds41_gpu_graph *g, const ds4_model *m,
         const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
         const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
         const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
+        /* The mixer on a side stream (joined before the expand that reads
+         * its split); here only the weighted sum + norm needed right away. */
+        if (fn->type == DS4_TENSOR_F16 && fn->dim[0] == 20480u && fn->dim[1] == 24u &&
+            g->tp_world == 1u && !g->imatrix && !getenv("DS4_V41_TRACE_POS")) {
+            const int side = ds4_gpu_dsv41_hc_mix_side(ffn ? g->ffn_split : g->attn_split,
+                g->mix, g->flat_norm, residual, m->map, m->size, fn->abs_offset,
+                scale->abs_offset, base->abs_offset, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS,
+                DS4_RMS_EPS);
+            if (side < 0) return false;
+            if (side > 0)
+                return ds4_gpu_dsv41_hc_wsum_norm_rows(g->x, g->norm, residual, w, 4u,
+                    m->map, m->size, norm_weight->abs_offset, 1u, DS4_RMS_EPS) != 0;
+        }
         return ds4_gpu_rms_norm_plain_tensor(g->flat_norm, residual,
                    DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS) &&
                ds41_matmul(g->mix, m, fn, g->flat_norm, false) &&
@@ -41581,11 +41627,19 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (prefetched) {
         /* router and expert fetch already issued pre-attention */
     } else {
+#ifdef DS4_ROCM_BUILD
+        /* Miss penalty (DS4_V41_MISS_PENALTY): see ds4_gpu_dsv41_route_penalty_begin. */
+        const int penalized = g->streaming && bias == l->ffn_exp_probs_b ?
+            ds4_gpu_dsv41_route_penalty_begin(m->map, m->size, bias->abs_offset, il) : 0;
+#endif
         ok = ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) &&
             ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
                 m->map, m->size, bias->abs_offset, 0, 0, token,
                 DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
                 g->route_logits);
+#ifdef DS4_ROCM_BUILD
+        if (penalized) ds4_gpu_dsv41_route_penalty_end();
+#endif
     }
     if (profile) ok = ds41_decode_stage_profile_mark("moe_route", il, start, ok);
     if (!ok) return false;
@@ -41734,6 +41788,30 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
         start = now_sec();
         ok = ds41_moe_finish(g, il);
         if (profile) ok = ds41_decode_stage_profile_mark("moe_finish", il, start, ok);
+    }
+    /* Diagnostic: DS4_V41_ROUTE_DUMP=1 prints the 16 best router scores of
+     * each decoded layer (drains the GPU; for offline prefetch studies). */
+    static int route_dump = -1;
+    if (route_dump < 0) route_dump = getenv("DS4_V41_ROUTE_DUMP") != NULL;
+    if (ok && route_dump) {
+        float probs[DS4_N_EXPERT];
+        const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
+        ok = ds4_gpu_synchronize() && ds4_gpu_tensor_read(g->route_probs, 0, probs, sizeof(probs));
+        if (ok) {
+            const float *b = (const float *)((const uint8_t *)m->map + bias->abs_offset);
+            bool used[DS4_N_EXPERT]; memset(used, 0, sizeof(used));
+            fprintf(stderr, "ds4: RD %u %u", g->pos, il);
+            for (int k = 0; k < 16; k++) {
+                int best = -1; float bs = -1e30f;
+                for (int e = 0; e < (int)DS4_N_EXPERT; e++) {
+                    const float sc = probs[e] + b[e];
+                    if (!used[e] && sc > bs) { bs = sc; best = e; }
+                }
+                used[best] = true;
+                fprintf(stderr, " %d:%.4f", best, bs);
+            }
+            fprintf(stderr, "\n");
+        }
     }
     return ok;
 }
@@ -41896,7 +41974,11 @@ static bool ds41_hc_mix_batch(
         if (result < 0) return false;
         projected = result > 0 || ds41_matmul_batch(b->mix, m, fn, b->flat_norm, count, false);
     } else
-    projected = fn->type == DS4_TENSOR_F16 && count > DS4_TP_BATCH_MAX_ROWS ?
+    /* Speculative verifies of up to sixteen rows keep the small-row mixer
+     * (one launch reusing the weights); prefill tails keep their path. */
+    projected = fn->type == DS4_TENSOR_F16 &&
+            count > (g->draft && g->draft->verify_rows ? (uint32_t)DS41_STEP_BATCH_MAX_ROWS :
+                                                          (uint32_t)DS4_TP_BATCH_MAX_ROWS) ?
 #else
     const bool projected =
 #endif
@@ -42299,7 +42381,10 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 #ifdef DS4_ROCM_BUILD
         /* Window rows before this batch are still in the layer's ring (slot
          * pos % 128); this batch's own rows are b->kv. */
-        ok = g->tp_world == 1u && ds4_gpu_dsv41_attention_fp4_batch(b->heads, m->map, m->size,
+        /* Not for speculative verifies: packing every compressed row per
+         * call only pays off across a prefill chunk. */
+        ok = g->tp_world == 1u && !(g->draft && g->draft->verify_rows) &&
+            ds4_gpu_dsv41_attention_fp4_batch(b->heads, m->map, m->size,
             sinks, b->q, g->window[il], b->kv, g->compressed[owner], b->selected_comp,
             count, start, n_comp, DS4_N_INDEXER_TOP_K, 128, ratio, heads, DS4_N_HEAD_DIM) != 0;
         if (!ok)
@@ -42334,6 +42419,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
 #ifdef DS4_ROCM_BUILD
+    if (!ds4_gpu_dsv41_hc_mix_side_join()) return false;
     if (ds41_norm_fuse_on() && g->tp_world == 1u)
         return ds4_gpu_hc_expand_split_bf16_tensor(g->residual, g->block, g->after_attn,
             g->ffn_split, DS4_N_EMBD, DS4_N_HC, g->pre) != 0;
@@ -42439,14 +42525,33 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
 }
 #endif
 
+static uint32_t g_ds41_route_layer;   /* layer of the batch being routed (miss-penalty experiment) */
+static bool ds41_route_batch_six(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t count);
 static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_layer_weights *l, uint32_t count) {
+    return ds41_route_batch_six(g, m, l, count);
+}
+static bool ds41_route_batch_six(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
-    if (!g->image_count) return ds4_gpu_router_select_batch_tensor(
-        b->selected, b->route_weights, b->route_probs, m->map, m->size,
-        l->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
-        b->route_logits, g->prefill_tokens, DS4_N_EXPERT, DS4_N_EXPERT_USED,
-        DS4_EXPERT_WEIGHT_SCALE, count);
+    if (!g->image_count) {
+#ifdef DS4_ROCM_BUILD
+        /* Speculative verifies select like one-token decode (miss-penalty experiment). */
+        const int penalized = g->streaming && g->draft && g->draft->verify_rows ?
+            ds4_gpu_dsv41_route_penalty_begin(m->map, m->size,
+                l->ffn_exp_probs_b->abs_offset, g_ds41_route_layer) : 0;
+#endif
+        const bool routed = ds4_gpu_router_select_batch_tensor(
+            b->selected, b->route_weights, b->route_probs, m->map, m->size,
+            l->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
+            b->route_logits, g->prefill_tokens, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+            DS4_EXPERT_WEIGHT_SCALE, count);
+#ifdef DS4_ROCM_BUILD
+        if (penalized) ds4_gpu_dsv41_route_penalty_end();
+#endif
+        return routed;
+    }
     /* The ordinary 384-expert selector already has the right scoring and
      * normalization. Split only where the text/visual selection bias changes. */
     for (uint32_t first = 0; first < count;) {
@@ -42555,6 +42660,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 #endif
     ok = ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false);
     ds41_sub("ffn router matmul");
+    g_ds41_route_layer = il;
     ok = ok && ds41_route_batch(g, m, l, count);
     ds41_sub("ffn route select");
 #ifdef DS4_ROCM_BUILD
@@ -42562,9 +42668,18 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
      * loads right after routing (waiting only on the router), so missing-expert
      * reads overlap the shared expert and the resident-expert compute (the
      * routed launch then takes the resident/missing split path). */
-    if (ok && !stage_selected && g->streaming && g->draft && count > 1u && count <= 8u &&
-        ds41_dspark_ssd_allowed() && getenv("DS4_ROCM_V41_DSPARK_SSD_PREFETCH")) {
-        int32_t ids[8u * 6u];
+    /* Prompt-lookup verifies always do this (DS4_ROCM_V41_LOOKUP_PREFETCH=0
+     * restores the synchronous read inside the routed launch). */
+    static int lookup_prefetch = -1;
+    if (lookup_prefetch < 0) {
+        const char *v = getenv("DS4_ROCM_V41_LOOKUP_PREFETCH");
+        lookup_prefetch = !(v && v[0] == '0');
+    }
+    if (ok && !stage_selected && g->streaming && g->draft && count > 1u &&
+        count <= (uint32_t)DS41_STEP_BATCH_MAX_ROWS &&
+        ((lookup_prefetch && !g->draft->w && g->draft->verify_rows) ||
+         (count <= 8u && ds41_dspark_ssd_allowed() && getenv("DS4_ROCM_V41_DSPARK_SSD_PREFETCH")))) {
+        int32_t ids[DS41_STEP_BATCH_MAX_ROWS * 6u];
         ds4_gpu_stream_expert_table table;
         if (DS4_N_EXPERT_USED == 6u && ds41_stream_table(m, l, il, &table) &&
             ds4_gpu_tensor_read(b->selected, 0, ids, (uint64_t)count * 6u * sizeof(int32_t)))
@@ -42706,7 +42821,7 @@ static bool ds41_draft_pending(ds41_gpu_graph *g) {
     ds41_draft *d = g->draft;
     const ds4_dspark_weights *dw = d->w;
     const uint32_t n = d->mh_rows, dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM;
-    if (!n) return true;
+    if (!n || !dw) return true;   /* lookup-only state has no drafter features */
     ds4_gpu_tensor *mh = ds4_gpu_tensor_view(d->mh, 0,
         (uint64_t)n * d->n_target * dim * sizeof(float));
     ds4_gpu_tensor *mx = ds4_gpu_tensor_view(d->rows_x, 0,
@@ -43147,6 +43262,53 @@ static bool ds41_draft_init(ds41_gpu_graph *g,
     g->draft = d;
     g->allocation_bytes = ds4_add_sat_u64(g->allocation_bytes,
                                            ds41_draft_bytes(dw));
+    return true;
+}
+
+/* Verification state for prompt-lookup drafting: the buffers a multi-row
+ * verify and its rollback need, without any drafter. A verification carries
+ * six rows, or twelve once three six-row drafts in a row were fully accepted
+ * (a long copy): on recorded agent sessions most copies are short, so wider
+ * drafts by default lose more to rejected rows than they gain. */
+#define DS41_LOOKUP_BLOCK 11u      /* widest draft: twelve rows per verification */
+#define DS41_LOOKUP_BASE_BLOCK 5u  /* usual draft: six rows */
+static bool ds41_lookup_enabled(void) {
+#ifdef DS4_ROCM_BUILD
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_V41_LOOKUP");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+#else
+    return false;
+#endif
+}
+static bool ds41_lookup_init(ds41_gpu_graph *g) {
+    if (g->lookup || g->draft || DS4_N_HC > 8u) return g->lookup != NULL;
+    ds41_draft *d = xcalloc(1, sizeof(*d));
+    d->block = DS41_LOOKUP_BLOCK;
+    {
+        /* DS4_V41_LOOKUP_ROWS: rows per verification (current token + drafts). */
+        const char *v = getenv("DS4_V41_LOOKUP_ROWS");
+        const int rows = v && v[0] ? atoi(v) : 0;
+        if (rows >= 2 && rows <= (int)DS4_DSPARK_MAX_BLOCK_SIZE) d->block = (uint32_t)rows - 1u;
+    }
+    const uint64_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM, B = d->block;
+    if (!(d->xn = ds4_gpu_tensor_alloc((B + 1u) * dim * sizeof(float))) ||
+        !(d->saved = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER *
+            (DS4_DSPARK_MAX_BLOCK_SIZE + 1u) * hd * sizeof(float))) ||
+        !(d->pool_kv = ds4_gpu_tensor_alloc(4u *
+            (DS4_DSPARK_MAX_BLOCK_SIZE + 1u) * hd * sizeof(float))) ||
+        !(d->pool_score = ds4_gpu_tensor_alloc(4u *
+            (DS4_DSPARK_MAX_BLOCK_SIZE + 1u) * hd * sizeof(float))) ||
+        !(d->rows_logits = ds4_gpu_tensor_alloc_managed((B + 1u) *
+            DS4_N_VOCAB * sizeof(float))) ||
+        !(d->rows_x = ds4_gpu_tensor_alloc((B + 1u) * dim * sizeof(float)))) {
+        ds41_draft_free(d);
+        return false;
+    }
+    g->lookup = d;
     return true;
 }
 
@@ -43844,6 +44006,14 @@ static bool ds41_stream_layer_start(ds41_stream_layer_load *job,
     ds4_gpu_stream_expert_table table;
     if (!job || job->active || il >= DS4_N_LAYER ||
         !ds41_stream_table(m, &w->layer[il], il, &table)) return false;
+    if (ds4_gpu_dsv41_stream_direct_noslot()) {
+        /* No layer slots: a whole layer is a selected plan of every expert,
+         * staged into the dynamic cache. */
+        static int32_t all[DS4_MAX_EXPERT];
+        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) all[i] = (int32_t)i;
+        ds4_gpu_dsv41_stream_selected_rows_hint(2048u);
+        return ds41_stream_layer_start_plan(job, &table, all, DS4_N_EXPERT);
+    }
     return ds41_stream_layer_start_plan(job, &table, NULL, 0);
 }
 
@@ -43866,6 +44036,12 @@ static bool ds41_stream_layer_start_full_l(ds41_stream_layer_load *job,
     ds4_gpu_stream_expert_table table;
     if (!job || job->active || il >= DS4_N_LAYER ||
         !ds41_stream_table(m, l, il, &table)) return false;
+    if (ds4_gpu_dsv41_stream_direct_noslot()) {
+        static int32_t all[DS4_MAX_EXPERT];
+        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) all[i] = (int32_t)i;
+        ds4_gpu_dsv41_stream_selected_rows_hint(2048u);
+        return ds41_stream_layer_start_plan(job, &table, all, DS4_N_EXPERT);
+    }
     return ds41_stream_layer_start_plan(job, &table, NULL, 0);
 }
 
@@ -43931,7 +44107,7 @@ static bool ds41_selective_sweep_enabled(const ds41_gpu_graph *g, uint32_t total
  * (ds4_gpu_dsv41_stream_prepare_layer_topup). A wrong prediction costs reads,
  * never results: the routed kernels only touch really selected experts.
  * DS4_ROCM_V41_STAGE_PREDICT=0 disables; DS4_ROCM_V41_STAGE_PREDICT_MIN_ROWS
- * (default 512) and DS4_ROCM_V41_STAGE_PREDICT_MIN_VOTES override the policy. */
+ * (default 256) and DS4_ROCM_V41_STAGE_PREDICT_MIN_VOTES override the policy. */
 static struct {
     ds41_stream_layer_load job;
     ds4_gpu_dsv41_stream_layer_plan plan; /* loaded plan of a joined prefetch */
@@ -43967,7 +44143,10 @@ static uint32_t ds41_stage_predict_min_rows(void) {
     static int rows = -1;
     if (rows < 0) {
         const char *v = getenv("DS4_ROCM_V41_STAGE_PREDICT_MIN_ROWS");
-        rows = v && v[0] ? atoi(v) : 512;
+        /* 256 since 2026-11-13: with four votes below 512 rows a content
+         * shift append of 256-384 tokens runs 10-12 % faster and warm text is
+         * unchanged; 128 rows still lost 2-3 % on warm text. */
+        rows = v && v[0] ? atoi(v) : 256;
         if (rows < 1) rows = 1;
     }
     return (uint32_t)rows;
@@ -44062,8 +44241,14 @@ static void ds41_stream_predict_launch(const ds4_model *m, const ds4_layer_weigh
     /* Measured 2026-11-11 (A/B/B/A, identical logits): one vote is best from
      * 1024 rows (+1024 tokens 5.93 -> 5.61 s, +2048 9.95 -> 8.19 s), two votes
      * for 512-1023 rows (+712 tokens 5.17 -> 4.89 s). Below 512 rows the
-     * prediction does not pay (see ds41_stage_predict_min_rows). */
-    const int votes = votes_env ? votes_env : (n >= 1024u * DS4_N_EXPERT_USED ? 1 : 2);
+     * prediction does not pay (see ds41_stage_predict_min_rows).
+     * Re-measured 2026-11-13 with a content shift (prose then code) as well as
+     * the warm novel, 3 A/B pairs each: 1024-2047 rows want three votes
+     * (+1024 tokens shift 7.73 -> 7.12 s, warm 5.12 -> 4.96 s); at 712 and 2048
+     * rows the two workloads disagree by 2-3 %, so those keep two and one. */
+    const int votes = votes_env ? votes_env :
+        (n >= 2048u * DS4_N_EXPERT_USED ? 1 : n >= 1024u * DS4_N_EXPERT_USED ? 3 :
+         n >= 512u * DS4_N_EXPERT_USED ? 2 : 4);
     {
         uint32_t kept = 0;
         if (g_ds41_pred.ids_cap < 384u) return;
@@ -45124,6 +45309,16 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                         g, &w->layer[il], il, count, start);
             }
 #endif
+#ifdef DS4_ROCM_BUILD
+            if (ok && g->streaming && count <= 2048u && ds4_gpu_stream_access_log_on()) {
+                static int32_t access_ids[2048u * DS4_MAX_EXPERT_USED];
+                if (ds4_gpu_tensor_read(g->batch.selected, 0, access_ids,
+                        (uint64_t)count * DS4_N_EXPERT_USED * sizeof(int32_t)))
+                    ds4_gpu_stream_access_note_prefill(il, start, access_ids, count,
+                        DS4_N_EXPERT_USED, encoder_only || off + count != total_count ? 0 :
+                        initial_start > 0u ? 2 : 1);
+            }
+#endif
             if (ok && !encoder_only && off + count == total_count)
                 ok = ds41_prefill_seed(g, m, &w->layer[il], il, count, initial_start > 0u);
             if (engram_prefetched && ds41_engram_layer(il) && off + count == total_count &&
@@ -45193,7 +45388,7 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
                                    total, cancel, cancel_ud, false, false);
 }
 static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int count) {
-    if (!graphs || count < 2 || count > DS4_TP_BATCH_MAX_ROWS) return NULL;
+    if (!graphs || count < 2 || count > DS41_STEP_BATCH_MAX_ROWS) return NULL;
     ds41_gpu_graph *largest = NULL;
     for (int i = 0; i < count; i++) {
         ds41_gpu_graph *g = graphs[i];
@@ -45239,7 +45434,7 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights) {
-    if (!graphs || !tokens || count < 2 || count > DS4_TP_BATCH_MAX_ROWS ||
+    if (!graphs || !tokens || count < 2 || count > DS41_STEP_BATCH_MAX_ROWS ||
         prefill_rows > (uint32_t)count) return false;
     /* Sparse block masks scale with context, even when prefill caps match.
      * Attention and Engram history remain private to each session. */
@@ -45271,14 +45466,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds41_prefill_row active = {0};
-    ds4_engram_history history[DS4_TP_BATCH_MAX_ROWS];
-    uint32_t positions[DS4_TP_BATCH_MAX_ROWS];
+    ds4_engram_history history[DS41_STEP_BATCH_MAX_ROWS];
+    uint32_t positions[DS41_STEP_BATCH_MAX_ROWS];
     /* Only the leading prefill rows share a session. Keep their disk reads
      * and hash history distinct until the final row is published. */
     float (*engram)[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] = prefill_rows > 1 ?
         malloc(prefill_rows * sizeof(*engram)) : NULL;
-    ds4_gpu_tensor *queries[DS4_TP_BATCH_MAX_ROWS] = {0};
-    ds4_gpu_tensor *heads[DS4_TP_BATCH_MAX_ROWS] = {0};
+    ds4_gpu_tensor *queries[DS41_STEP_BATCH_MAX_ROWS] = {0};
+    ds4_gpu_tensor *heads[DS41_STEP_BATCH_MAX_ROWS] = {0};
     bool ok = rows <= g->prefill_cap && (prefill_rows <= 1 || engram);
 #define DS41_SESSION_VIEW(name, width) \
     if (ok) ok = (active.name = ds4_gpu_tensor_view(g->batch.name, 0, \
@@ -45320,7 +45515,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     bool any_images = false;
     for (int i = 0; i < count; i++) any_images = any_images || graphs[i]->image_count;
     if (ok && any_images) {
-        uint8_t text_mask[DS4_TP_BATCH_MAX_ROWS];
+        uint8_t text_mask[DS41_STEP_BATCH_MAX_ROWS];
         for (int i = 0; i < count; i++)
             text_mask[i] = ds41_image_at(graphs[i], positions[i]) ? 0u : 1u;
         ok = ds4_gpu_tensor_write(g->image_text_mask, 0, text_mask, (uint64_t)count) != 0;
@@ -45565,7 +45760,7 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
                               uint32_t n, float *logits_rows) {
     ds41_draft *d = g->draft;
     if (!d || !g->valid || n < 2u || n > d->block + 1u ||
-        n > DS4_TP_BATCH_MAX_ROWS || g->pos > g->ctx || n > g->ctx - g->pos)
+        n > DS41_STEP_BATCH_MAX_ROWS || g->pos > g->ctx || n > g->ctx - g->pos)
         return false;
 #ifdef DS4_ROCM_BUILD
     /* gfx1151's highly tuned resident one-row trunk is substantially faster
@@ -45602,7 +45797,7 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
         return ok;
     }
 #endif
-    ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
+    ds41_gpu_graph *graphs[DS41_STEP_BATCH_MAX_ROWS];
     for (uint32_t i = 0; i < n; i++) graphs[i] = g;
     d->verify_rows = n;
     d->mh_pos0 = g->pos;
@@ -45613,6 +45808,14 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
      * routed-MoE shapes used by V4.1; the model-specific dimensions remain
      * checked at each backend dispatch. */
     ds4_gpu_set_dspark_verify_mode(true);
+    g_ds41_wide_verify = true;
+    {
+        /* The decode-arithmetic routed kernels also serve drafter verifies
+         * under SSD streaming (DS4_ROCM_V41_DSPARK_DECODE_LIKE=0: lookup only). */
+        static int all = -1;
+        if (all < 0) { const char *v = getenv("DS4_ROCM_V41_DSPARK_DECODE_LIKE"); all = !(v && v[0] == '0'); }
+        ds4_gpu_set_v41_decode_like_batch(!d->w || (all && g->streaming));
+    }
     const char *dense_env = getenv("DS4_ROCM_DSPARK_V41_GENERIC_DENSE");
     g_ds41_dspark_verify_dense = dense_env && dense_env[0] != '0';
 #endif
@@ -45644,6 +45847,8 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
 #ifdef DS4_ROCM_BUILD
     g_ds41_dspark_verify_dense = false;
     ds4_gpu_set_dspark_verify_mode(false);
+    ds4_gpu_set_v41_decode_like_batch(false);
+    g_ds41_wide_verify = false;
 #endif
     d->verify_rows = 0;
     if (!ok) {
@@ -63817,6 +64022,17 @@ struct ds4_session {
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     ds41_gpu_graph ds41_graph;
     bool ds41_graph_ready;
+    /* In-memory rewind points (see ds41_snap_capture). */
+    struct ds41_snap {
+        uint32_t pos;
+        bool valid;
+        uint64_t token_hash;
+        ds4_engram_history history;
+        float *state;   /* 40 windows of 128 x 512, then 3 x (previous kv, score) */
+        float *logits;
+    } ds41_snaps[16];
+    uint32_t ds41_snap_next;
+    uint32_t ds41_snap_last_pos;
 #endif
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
@@ -63912,6 +64128,8 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    bool lookup_allowed;   /* caller permits prompt-lookup drafts for the next eval */
+    bool lookup_syntax;    /* ... and the next tokens are forced-greedy tool-call syntax */
     bool greedy_splitkv_anchor_valid;
 };
 
@@ -65816,6 +66034,26 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s) {
     return s ? &s->checkpoint : NULL;
 }
 
+/* Prompt-lookup drafting (DeepSeek V4.1, ROCm): available when the session
+ * has its verification buffers; the caller allows it per eval, and must not
+ * when it could need to rewind inside the returned block. */
+bool ds4_session_lookup_available(ds4_session *s) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    return s && ds4_session_is_ds41(s) && s->ds41_graph.lookup != NULL;
+#else
+    (void)s;
+    return false;
+#endif
+}
+void ds4_session_set_lookup(ds4_session *s, bool allowed) {
+    if (s) { s->lookup_allowed = allowed; s->lookup_syntax = false; }
+}
+/* The next tokens are tool-call syntax that the caller decodes greedily:
+ * lookup drafts are allowed and end with the token that closes a tag. */
+void ds4_session_set_lookup_syntax(ds4_session *s, bool syntax) {
+    if (s) { s->lookup_syntax = syntax; if (syntax) s->lookup_allowed = true; }
+}
+
 #ifndef DS4_NO_GPU
 static void spec_frontier_free(ds4_spec_frontier *f) {
     if (!f) return;
@@ -66019,6 +66257,8 @@ static bool ds41_payload_header_valid(ds4_session *s, const uint32_t *h,
         h[12] == 0x413431u && remaining == ds41_payload_body_bytes(g, pos);
 }
 
+static void ds41_snaps_clear(ds4_session *s);
+
 static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
                               uint64_t remaining, char *err, size_t errlen) {
     ds41_gpu_graph *g = &s->ds41_graph;
@@ -66042,6 +66282,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
     if (!rc) {
         s->checkpoint_valid = false;
         g->valid = false;
+        ds41_snaps_clear(s);
         rc = payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * 4u, &remaining, err, errlen);
         ds41_state_span spans[54];
         const uint32_t n = ds41_state_spans(g, pos, spans);
@@ -66073,6 +66314,148 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
     }
     ds4_tokens_free(&tokens);
     return rc;
+}
+
+/* In-memory rewind points for V4.1.
+ *
+ * The state at position P is the 40 sliding-window rings, the three
+ * unfinished compression pairs, the Engram n-gram history and the logits;
+ * every compressed/indexer cache row below P is append-only by position and
+ * stays valid while later tokens are added. So a ~10.5 MB copy taken at P
+ * lets a session whose next prompt diverges after P continue from P instead
+ * of re-prefilling everything (clients re-render their last turn, thinking
+ * flips, rewritten tool calls). Snapshots are taken only at committed points
+ * (no verify pending), at most one per 256 tokens plus one at the end of
+ * every prompt, in a ring of 16. `DS4_V41_SNAPSHOTS=0` disables them. */
+enum { DS41_SNAP_COUNT = 16, DS41_SNAP_SPACING = 256 };
+#define DS41_SNAP_WINDOW_FLOATS (128u * 512u)
+#define DS41_SNAP_STATE_FLOATS (40u * DS41_SNAP_WINDOW_FLOATS + 3u * 2u * 512u)
+
+static bool ds41_snap_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_V41_SNAPSHOTS");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+}
+
+static uint64_t ds41_snap_hash(const ds4_session *s, uint32_t pos) {
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (uint32_t i = 0; i < pos; i++) {
+        h ^= (uint32_t)s->checkpoint.v[i];
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static void ds41_snaps_clear(ds4_session *s) {
+    for (uint32_t i = 0; i < DS41_SNAP_COUNT; i++) s->ds41_snaps[i].valid = false;
+    s->ds41_snap_last_pos = 0;
+}
+
+static void ds41_snaps_free(ds4_session *s) {
+    for (uint32_t i = 0; i < DS41_SNAP_COUNT; i++) {
+        free(s->ds41_snaps[i].state);
+        free(s->ds41_snaps[i].logits);
+        memset(&s->ds41_snaps[i], 0, sizeof(s->ds41_snaps[i]));
+    }
+    s->ds41_snap_last_pos = 0;
+}
+
+static void ds41_snap_capture(ds4_session *s, bool force) {
+    if (!s || !ds41_snap_enabled() || !s->ds41_graph_ready) return;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    const uint32_t pos = g->pos;
+    if (!g->valid || !s->checkpoint_valid || pos == 0 || pos != (uint32_t)s->checkpoint.len)
+        return;
+    if (pos < s->ds41_snap_last_pos) s->ds41_snap_last_pos = 0; /* moved back */
+    if (!force && s->ds41_snap_last_pos &&
+        pos < s->ds41_snap_last_pos + DS41_SNAP_SPACING) return;
+    for (uint32_t i = 0; i < DS41_SNAP_COUNT; i++)
+        if (s->ds41_snaps[i].valid && s->ds41_snaps[i].pos == pos) return;
+    struct ds41_snap *sn = &s->ds41_snaps[s->ds41_snap_next % DS41_SNAP_COUNT];
+    if (!sn->state) sn->state = malloc((size_t)DS41_SNAP_STATE_FLOATS * sizeof(float));
+    if (!sn->logits) sn->logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (!sn->state || !sn->logits) return;
+    sn->valid = false;
+    if (!ds4_gpu_synchronize()) return;
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < 40; il++)
+        ok = ds4_gpu_tensor_read(g->window[il], 0, sn->state + (size_t)il * DS41_SNAP_WINDOW_FLOATS,
+                                 (uint64_t)DS41_SNAP_WINDOW_FLOATS * 4u) != 0;
+    float *prev = sn->state + (size_t)40u * DS41_SNAP_WINDOW_FLOATS;
+    for (uint32_t i = 0; ok && i < 3; i++)
+        ok = ds4_gpu_tensor_read(g->previous_kv[i], 0, prev + i * 1024u, 512u * 4u) != 0 &&
+             ds4_gpu_tensor_read(g->previous_score[i], 0, prev + i * 1024u + 512u, 512u * 4u) != 0;
+    if (!ok) return;
+    memcpy(sn->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    sn->history = g->history;
+    sn->pos = pos;
+    sn->token_hash = ds41_snap_hash(s, pos);
+    sn->valid = true;
+    s->ds41_snap_next++;
+    s->ds41_snap_last_pos = pos;
+}
+
+/* Largest snapshot position <= max_pos whose tokens are still the session's
+ * prefix, or -1. */
+static int ds41_snap_best(ds4_session *s, int max_pos) {
+    if (!s || !ds41_snap_enabled() || !s->ds41_graph_ready || !s->checkpoint_valid) return -1;
+    int best = -1;
+    for (uint32_t i = 0; i < DS41_SNAP_COUNT; i++) {
+        const struct ds41_snap *sn = &s->ds41_snaps[i];
+        if (!sn->valid || (int)sn->pos > max_pos || (int)sn->pos > s->checkpoint.len ||
+            (int)sn->pos <= best) continue;
+        if (sn->token_hash != ds41_snap_hash(s, sn->pos)) continue;
+        best = (int)sn->pos;
+    }
+    return best;
+}
+
+static bool ds41_snap_restore(ds4_session *s, int pos) {
+    if (ds41_snap_best(s, pos) != pos) return false;
+    struct ds41_snap *sn = NULL;
+    for (uint32_t i = 0; i < DS41_SNAP_COUNT; i++)
+        if (s->ds41_snaps[i].valid && (int)s->ds41_snaps[i].pos == pos) sn = &s->ds41_snaps[i];
+    if (!sn) return false;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    if (!ds4_gpu_synchronize()) return false;
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < 40; il++)
+        ok = ds4_gpu_tensor_write(g->window[il], 0, sn->state + (size_t)il * DS41_SNAP_WINDOW_FLOATS,
+                                  (uint64_t)DS41_SNAP_WINDOW_FLOATS * 4u) != 0;
+    const float *prev = sn->state + (size_t)40u * DS41_SNAP_WINDOW_FLOATS;
+    for (uint32_t i = 0; ok && i < 3; i++)
+        ok = ds4_gpu_tensor_write(g->previous_kv[i], 0, prev + i * 1024u, 512u * 4u) != 0 &&
+             ds4_gpu_tensor_write(g->previous_score[i], 0, prev + i * 1024u + 512u, 512u * 4u) != 0;
+    if (!ok) {
+        s->checkpoint_valid = false;
+        g->valid = false;
+        ds41_snaps_clear(s);
+        return false;
+    }
+    ds41_graph_reset(g);
+    g->history = sn->history;
+    g->pos = (uint32_t)pos;
+    memcpy(s->logits, sn->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    s->checkpoint.len = pos;
+    s->checkpoint_valid = true;
+    /* Later snapshots describe rows the replay will overwrite. */
+    for (uint32_t i = 0; i < DS41_SNAP_COUNT; i++)
+        if (s->ds41_snaps[i].valid && (int)s->ds41_snaps[i].pos > pos) s->ds41_snaps[i].valid = false;
+    s->ds41_snap_last_pos = (uint32_t)pos;
+    /* Keep only the images that lie wholly before the rewind point. */
+    size_t keep = 0;
+    while (keep < s->checkpoint_image_count &&
+           (uint64_t)s->checkpoint_images[keep].token_start +
+           s->checkpoint_images[keep].token_count <= (uint64_t)pos) keep++;
+    s->checkpoint_image_count = keep;
+    if (!keep) {
+        free(s->checkpoint_images);
+        s->checkpoint_images = NULL;
+    }
+    return true;
 }
 #endif
 #ifdef DS4_HAS_QWEN4_GPU
@@ -72041,7 +72424,10 @@ static bool ds41_stream_cache_configure(ds4_engine *e) {
         if (expert && expert != bytes) return false;
         expert = bytes;
     }
-    const uint64_t slots = 2u * DS4_N_EXPERT * expert;
+    /* With direct staging the two layer slots are not reserved: staged
+     * experts are read into the dynamic cache, which gets their memory. */
+    const bool direct = ds4_gpu_dsv41_stream_direct_stage_available() != 0;
+    const uint64_t slots = direct ? 0 : 2u * DS4_N_EXPERT * expert;
     const uint64_t requested = e->ssd_streaming_cache_bytes;
     const uint32_t maximum = DS4_N_LAYER * DS4_N_EXPERT;
     uint64_t count = e->ssd_streaming_cache_experts;
@@ -75659,7 +76045,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     !ds41_stream_table(&e->model, &e->weights.layer[0], 0, &even) ||
                     !ds41_stream_table(&e->model, &e->weights.layer[1], 1, &odd) ||
                     !ds4_gpu_stream_expert_cache_quiesce() ||
-                    !ds4_gpu_stream_expert_cache_reserve_layers(&even, &odd)) {
+                    (e->ssd_streaming_prefill_headroom_bytes != 0 &&
+                     !ds4_gpu_stream_expert_cache_reserve_layers(&even, &odd))) {
                     fprintf(stderr, "ds4: V4.1 SSD failed to reserve both admitted expert layers\n");
                     ds4_engine_close(e);
                     *out = NULL;
@@ -76920,6 +77307,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s);
             return 1;
         }
+        /* Prompt-lookup drafting needs no support model. Single-GPU ROCm only;
+         * a failed allocation just leaves it off. */
+        if (!e->ds41_dspark && !e->tp.active && !e->quality && ds41_lookup_enabled() &&
+            e->backend != DS4_BACKEND_CPU)
+            (void)ds41_lookup_init(&s->ds41_graph);
         if (e->tp.active) {
             s->ds41_graph.tp_world = 2;
             s->ds41_graph.tp_rank = (uint32_t)e->tp.rank;
@@ -77385,6 +77777,7 @@ void ds4_session_free(ds4_session *s) {
 #ifndef DS4_NO_GPU
     else {
 #ifdef DS4_HAS_DEEPSEEK41_GPU
+        ds41_snaps_free(s);
         if (s->ds41_graph_ready) {
             s->engine->ds41_session_bytes -= s->ds41_graph.allocation_bytes;
             ds41_graph_free(&s->ds41_graph);
@@ -79075,6 +79468,42 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
     return true;
 }
 
+/* Image identities of the committed checkpoint, in token order. Returns
+ * SIZE_MAX while a multimodal sync is in progress (identities not final). */
+size_t ds4_session_vision_identities(const ds4_session *s, uint32_t *starts,
+                                     uint32_t *counts, uint8_t (*fps)[32], size_t cap) {
+    if (!s || !s->checkpoint_valid) return 0;
+    if (s->sync_image_count != 0) return SIZE_MAX;
+    for (size_t i = 0; i < s->checkpoint_image_count && i < cap; i++) {
+        if (starts) starts[i] = s->checkpoint_images[i].token_start;
+        if (counts) counts[i] = s->checkpoint_images[i].token_count;
+        if (fps) memcpy(fps[i], s->checkpoint_images[i].fingerprint, 32);
+    }
+    return s->checkpoint_image_count;
+}
+
+/* After restoring a disk checkpoint whose key carried image fingerprints,
+ * record which of the request's images lie inside the restored prefix. */
+bool ds4_session_adopt_vision_identities(ds4_session *s, const ds4_vision_span *spans,
+                                         size_t n) {
+    if (!s || !s->checkpoint_valid || (n && !spans)) return false;
+    size_t keep = 0;
+    while (keep < n && (uint64_t)spans[keep].token_start +
+           spans[keep].embedding.token_count <= (uint64_t)s->checkpoint.len) keep++;
+    if (keep < n && spans[keep].token_start < (uint32_t)s->checkpoint.len) return false;
+    ds4_vision_identity *copy = keep ? calloc(keep, sizeof(*copy)) : NULL;
+    if (keep && !copy) return false;
+    for (size_t i = 0; i < keep; i++) {
+        copy[i].token_start = spans[i].token_start;
+        copy[i].token_count = spans[i].embedding.token_count;
+        memcpy(copy[i].fingerprint, spans[i].embedding.fingerprint, sizeof(copy[i].fingerprint));
+    }
+    free(s->checkpoint_images);
+    s->checkpoint_images = copy;
+    s->checkpoint_image_count = keep;
+    return true;
+}
+
 bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
 }
@@ -79516,8 +79945,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         if (!s->checkpoint_valid || !g->valid || g->pos != (uint32_t)s->checkpoint.len ||
             !ds4_tokens_starts_with(prompt, &s->checkpoint)) {
             ds41_graph_reset(g);
+            ds41_snaps_clear(s);
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
+        } else if (prompt->len > s->checkpoint.len) {
+            ds41_snap_capture(s, true);
         }
         bool pending_logits = false, interrupted = false, decoder_pending = false;
         ds41_encoder_residency encoder = {0};
@@ -79602,6 +80034,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             snprintf(err, errlen, "interrupted");
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
+        ds41_snap_capture(s, true);
         return 0;
     }
 #endif
@@ -81476,6 +81909,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     ds4_engine *e = s->engine;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
+        if (s->ds41_graph_ready) ds41_snap_capture(s, false);
         if (!s->ds41_graph_ready ||
             (!s->checkpoint_valid && s->checkpoint.len != 0) ||
             s->ds41_graph.pos != (uint32_t)s->checkpoint.len ||
@@ -88526,6 +88960,335 @@ static bool ds41_draft_should_propose(bool draftable, bool cost_scheduled,
     return !skip_left || adaptive_off;
 }
 
+static bool ds41_lookup_control_token(const ds4_engine *e, int token, bool allow_dsml) {
+    const ds4_vocab *v = &e->vocab;
+    if (allow_dsml && v->dsml_id >= 0 && token == v->dsml_id) return false;
+    const int ids[] = {
+        v->bos_id, v->eos_id, v->system_id, v->user_id, v->assistant_id,
+        v->observation_id, v->sop_id, v->think_start_id, v->think_end_id,
+        v->tool_call_start_id, v->tool_call_end_id, v->tool_response_start_id,
+        v->tool_response_end_id, v->arg_key_start_id, v->arg_key_end_id,
+        v->arg_value_start_id, v->arg_value_end_id, v->dsml_id, v->im_start_id,
+        v->im_end_id, v->endoftext_id,
+    };
+    for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++)
+        if (ids[i] >= 0 && token == ids[i]) return true;
+    return false;
+}
+
+/* Frequency-scored lookup (the default proposer; DS4_V41_LOOKUP_PROPOSER=match
+ * restores the longest-match one below).
+ *
+ * For every position of the session's token history, six tables count which
+ * token followed the preceding 12, 8, 6, 4, 3 and 2 tokens. A draft is built
+ * by chaining: take the longest pattern that has been seen, propose its most
+ * frequent continuation, append it and repeat. How likely each step is to be
+ * accepted is not assumed but measured: every (pattern length, agreement)
+ * class keeps its own running hit rate from past verifications, where
+ * agreement is "always the same continuation, seen 3+ times", "... twice",
+ * "seen once", "a majority continuation" or "no majority". The expected
+ * number of accepted tokens of a width is the sum of the products of those
+ * rates, and the width is chosen as in ds41_lookup_width from the measured
+ * step and row costs (one-token drafts included). The idea is SuffixDecoding's
+ * (count-based scores over the request's own history, speculation length from
+ * expected acceptance), with a linear chain instead of a tree.
+ *
+ * Offline replay of two recorded agent sessions (word-piece proxy), speedup
+ * over one-token decoding at 18.5 / 25 / 30 / 35 ms per verified row:
+ * 1.26 / 1.12 / 1.06 / 1.04 on one and 1.11 / 1.05 / 1.02 / 1.00 on the
+ * other, against 1.18 / 1.09 / 1.03 / 1.01 and 1.01 / 1.00 / 1.00 / 0.99 for
+ * the longest-match proposer with the bucket policy. */
+#define DS41_LK_LEVELS 6u
+#define DS41_LK_BINS 5u
+#define DS41_LK_MAX_N 12u
+static const uint32_t ds41_lk_n[DS41_LK_LEVELS] = {12u, 8u, 6u, 4u, 3u, 2u};
+typedef struct {
+    uint64_t key;                /* 0: empty */
+    int32_t tok1, tok2;          /* the two leading continuations */
+    uint32_t cnt1, cnt2, total;
+} ds41_lk_entry;
+struct ds41_lk_index {
+    ds41_lk_entry *e[DS41_LK_LEVELS];
+    uint32_t mask;               /* slots per level - 1 */
+    uint32_t indexed;            /* history tokens counted so far */
+    uint64_t tail;               /* hash of the last indexed tokens, to detect a new history */
+    float cal_acc[DS41_LK_LEVELS][DS41_LK_BINS], cal_try[DS41_LK_LEVELS][DS41_LK_BINS];
+    uint32_t skipped;
+};
+static void ds41_lk_index_free(struct ds41_lk_index *ix) {
+    if (!ix) return;
+    for (uint32_t l = 0; l < DS41_LK_LEVELS; l++) free(ix->e[l]);
+    free(ix);
+}
+static uint64_t ds41_lk_hash(const int *t, uint32_t n, uint32_t level) {
+    uint64_t h = UINT64_C(1469598103934665603) ^ ((uint64_t)(level + 1u) << 56);
+    for (uint32_t i = 0; i < n; i++) {
+        h ^= (uint32_t)t[i];
+        h *= UINT64_C(1099511628211);
+        h ^= h >> 29;
+    }
+    return h ? h : 1u;
+}
+static ds41_lk_entry *ds41_lk_slot(struct ds41_lk_index *ix, uint32_t level, uint64_t key,
+                                   bool create) {
+    ds41_lk_entry *tab = ix->e[level];
+    uint32_t at = (uint32_t)(key ^ (key >> 32)) & ix->mask;
+    for (uint32_t probe = 0; probe < 16u; probe++, at = (at + 1u) & ix->mask) {
+        if (tab[at].key == key) return &tab[at];
+        if (!tab[at].key) {
+            if (!create) return NULL;
+            tab[at].key = key;
+            return &tab[at];
+        }
+    }
+    if (!create) return NULL;
+    /* A full neighbourhood: reuse the home slot (the table is sized at four
+     * slots per history token, so this is rare). */
+    at = (uint32_t)(key ^ (key >> 32)) & ix->mask;
+    memset(&tab[at], 0, sizeof(tab[at]));
+    tab[at].key = key;
+    return &tab[at];
+}
+static void ds41_lk_count(struct ds41_lk_index *ix, const int *hist, uint32_t i) {
+    for (uint32_t l = 0; l < DS41_LK_LEVELS; l++) {
+        const uint32_t n = ds41_lk_n[l];
+        if (i < n) continue;
+        ds41_lk_entry *e = ds41_lk_slot(ix, l, ds41_lk_hash(hist + i - n, n, l), true);
+        const int32_t next = hist[i];
+        e->total++;
+        if (e->cnt1 && e->tok1 == next) e->cnt1++;
+        else if (!e->cnt1) { e->tok1 = next; e->cnt1 = 1; }
+        else if (e->cnt2 && e->tok2 == next) {
+            if (++e->cnt2 > e->cnt1) {
+                const int32_t t = e->tok1; const uint32_t c = e->cnt1;
+                e->tok1 = e->tok2; e->cnt1 = e->cnt2; e->tok2 = t; e->cnt2 = c;
+            }
+        } else if (!e->cnt2 || e->cnt2 == 1u) { e->tok2 = next; e->cnt2 = 1; }
+    }
+}
+/* Bring the tables up to date with hist[0..len). A shorter history, or one
+ * whose recent tokens differ from what was indexed, starts over. */
+static struct ds41_lk_index *ds41_lk_sync(ds41_draft *d, const int *hist, uint32_t len,
+                                          uint32_t ctx) {
+    struct ds41_lk_index *ix = d->lk_index;
+    if (!ix) {
+        ix = calloc(1, sizeof(*ix));
+        if (!ix) return NULL;
+        uint32_t slots = 1024u;
+        while (slots < 4u * ctx && slots < (1u << 22)) slots <<= 1;
+        ix->mask = slots - 1u;
+        for (uint32_t l = 0; l < DS41_LK_LEVELS; l++) {
+            ix->e[l] = calloc(slots, sizeof(ds41_lk_entry));
+            if (!ix->e[l]) { ds41_lk_index_free(ix); return NULL; }
+            /* Starting hit rates: what two recorded agent sessions measured
+             * for each class (rows: pattern length 12..2; columns: the same
+             * continuation 3+ times, twice, seen once, a majority, none). A
+             * fresh session would otherwise need hundreds of probes before
+             * it trusts even a long exact copy. Weight: twelve trials. */
+            static const float prior[DS41_LK_LEVELS][DS41_LK_BINS] = {
+                {0.98f, 0.87f, 0.81f, 0.68f, 0.23f},
+                {0.95f, 0.85f, 0.75f, 0.65f, 0.23f},
+                {0.92f, 0.83f, 0.71f, 0.61f, 0.31f},
+                {0.96f, 0.83f, 0.60f, 0.72f, 0.13f},
+                {0.90f, 0.67f, 0.52f, 0.49f, 0.18f},
+                {0.83f, 0.58f, 0.28f, 0.52f, 0.09f},
+            };
+            for (uint32_t b = 0; b < DS41_LK_BINS; b++) {
+                ix->cal_acc[l][b] = prior[l][b] * 12.0f;
+                ix->cal_try[l][b] = 12.0f;
+            }
+        }
+        d->lk_index = ix;
+    }
+    const uint32_t tail_n = ix->indexed < 8u ? ix->indexed : 8u;
+    if (ix->indexed > len ||
+        (tail_n && ds41_lk_hash(hist + ix->indexed - tail_n, tail_n, 99u) != ix->tail)) {
+        for (uint32_t l = 0; l < DS41_LK_LEVELS; l++)
+            memset(ix->e[l], 0, ((size_t)ix->mask + 1u) * sizeof(ds41_lk_entry));
+        ix->indexed = 0;
+    }
+    if (ix->indexed < len) {
+        for (uint32_t i = ix->indexed; i < len; i++) ds41_lk_count(ix, hist, i);
+        ix->indexed = len;
+        const uint32_t n = len < 8u ? len : 8u;
+        ix->tail = n ? ds41_lk_hash(hist + len - n, n, 99u) : 0;
+    }
+    return ix;
+}
+/* Chain up to max_k predictions after hist[0..len) + seed. level[]/bin[]
+ * identify each step's calibration class and expect[] is the running product
+ * of the classes' hit rates. Returns the chain length. */
+static uint32_t ds41_lk_chain(struct ds41_lk_index *ix, const int *hist, uint32_t len, int seed,
+                              int *drafts, uint8_t *level, uint8_t *bin, float *expect,
+                              uint32_t max_k) {
+    int ctx[DS41_LK_MAX_N + DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
+    uint32_t m = len < DS41_LK_MAX_N - 1u ? len : DS41_LK_MAX_N - 1u;
+    memcpy(ctx, hist + len - m, (size_t)m * sizeof(int));
+    ctx[m++] = seed;
+    float p = 1.0f;
+    uint32_t k = 0;
+    while (k < max_k) {
+        const ds41_lk_entry *e = NULL;
+        uint32_t l = 0;
+        for (; l < DS41_LK_LEVELS; l++) {
+            const uint32_t n = ds41_lk_n[l];
+            if (m < n) continue;
+            e = ds41_lk_slot(ix, l, ds41_lk_hash(ctx + m - n, n, l), false);
+            if (e && e->cnt1) break;
+            e = NULL;
+        }
+        if (!e) break;
+        const uint32_t b = e->cnt1 == e->total ? (e->total >= 3u ? 0u : e->total == 2u ? 1u : 2u) :
+                           2u * e->cnt1 > e->total ? 3u : 4u;
+        p *= ix->cal_acc[l][b] / ix->cal_try[l][b];
+        drafts[k] = e->tok1;
+        level[k] = (uint8_t)l;
+        bin[k] = (uint8_t)b;
+        expect[k] = p;
+        k++;
+        ctx[m++] = e->tok1;
+    }
+    return k;
+}
+/* Width with the best expected tokens per time, or 0 (a one-token probe every
+ * 64 skipped opportunities keeps the hit rates current). */
+static uint32_t ds41_lk_pick(ds41_draft *d, struct ds41_lk_index *ix, const float *expect,
+                             uint32_t available) {
+    static const uint32_t widths[6] = {1u, 2u, 3u, 5u, 8u, 11u};
+    float best = 1.05f, sum = 0.0f;
+    uint32_t pick = 0, at = 0;
+    for (uint32_t i = 0; i < 6u && widths[i] <= available; i++) {
+        while (at < widths[i]) sum += expect[at++];
+        const float gain = (1.0f + sum) * d->lk_plain_ms /
+            (0.85f * d->lk_plain_ms + d->lk_row_ms * (float)(widths[i] + 1u));
+        if (gain > best) { best = gain; pick = widths[i]; }
+    }
+    if (!pick && available) {
+        d->lk_stat_skipped++;
+        if (++ix->skipped >= 64u) { ix->skipped = 0; pick = 1u; }
+    }
+    return pick;
+}
+
+/* Sessions that contain images: every verified row is a text position after
+ * the images, the case the short-prefill batches already serve.
+ * DS4_V41_LOOKUP_IMAGES=0 keeps lookup off there. */
+static bool ds41_lookup_with_images(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_V41_LOOKUP_IMAGES");
+        on = !(v && v[0] == '0');
+    }
+    return on != 0;
+}
+
+/* How many lookup tokens to verify, or 0 for none.
+ *
+ * A verify of w drafts costs about one step plus w + 1 rows, and each row
+ * pays its own expert reads; at long context that is 25-35 ms per row, so a
+ * draft that is mostly rejected LOSES time. Recorded agent sessions differ a
+ * lot: file rewrites accept nearly everything, sessions of shell commands and
+ * numbers accept a third, and a fixed rule was 1.2x on one and 0.92-0.98x on
+ * another. So the decision is made from measurements: the running cost of a
+ * one-token step and of a verified row (both timed here), and the fraction of
+ * drafted tokens accepted so far for this kind of match (bucket: 2-3, 4-7,
+ * 8-15, 16-31, 32+ matching tokens, or the continuation of a fully accepted
+ * draft). A width is used only if it is expected to beat one-token decoding
+ * by 5 %; a bucket that keeps being skipped gets a two-token probe every 64
+ * opportunities so its statistics can recover. Replaying two sessions
+ * offline, this kept the gains (x1.19, 1.11, 1.06 at 18.5 / 25 / 30 ms per
+ * row) and held the bad case at 0.99-1.00 instead of 0.92-0.98. */
+static uint32_t ds41_lookup_bucket(const ds41_draft *d, uint32_t match) {
+    if (d->lk_run) return 5u;
+    return match < 4u ? 0u : match < 8u ? 1u : match < 16u ? 2u : match < 32u ? 3u : 4u;
+}
+static void ds41_lookup_policy_init(ds41_draft *d) {
+    static const float prior[6] = {0.45f, 0.50f, 0.65f, 0.70f, 0.85f, 0.90f};
+    if (d->lk_plain_ms > 0.0f) return;
+    d->lk_plain_ms = 75.0f;
+    d->lk_row_ms = 22.0f;
+    for (uint32_t b = 0; b < 6u; b++) {
+        d->lk_drafted[b] = 10.0f;
+        d->lk_acc[b] = prior[b] * 10.0f;
+    }
+}
+static uint32_t ds41_lookup_width(ds41_draft *d, uint32_t bucket, uint32_t available,
+                                  uint32_t wide) {
+    static int fixed = -1;
+    if (fixed < 0) fixed = getenv("DS4_V41_LOOKUP_FIXED_POLICY") != NULL;
+    if (fixed) return available;
+    const float rate = d->lk_acc[bucket] / d->lk_drafted[bucket];
+    const uint32_t widths[3] = {2u, DS41_LOOKUP_BASE_BLOCK, wide};
+    float best = 1.05f;
+    uint32_t pick = 0;
+    for (uint32_t i = 0; i < 3u; i++) {
+        const uint32_t w = widths[i];
+        if (w > available || (i == 2u && (d->lk_streak < 3u || w <= DS41_LOOKUP_BASE_BLOCK))) continue;
+        const float gain = (1.0f + (float)w * rate) * d->lk_plain_ms /
+            (0.85f * d->lk_plain_ms + d->lk_row_ms * (float)(w + 1u));
+        if (gain > best) { best = gain; pick = w; }
+    }
+    if (!pick) {
+        d->lk_stat_skipped++;
+        if (++d->lk_skipped[bucket] >= 64u) {
+            d->lk_skipped[bucket] = 0;
+            pick = available < 2u ? available : 2u;
+        }
+    }
+    return pick;
+}
+
+/* Prompt-lookup drafting: when the text being generated repeats text already
+ * in the context (file edits, tool-call arguments, quotes), the tokens that
+ * followed the previous occurrence are a free draft. Finds the most recent
+ * earlier position whose preceding min_match tokens equal the current tail
+ * (history + seed) and returns up to max_k tokens that followed it. */
+static uint32_t ds41_lookup_draft(const int *hist, uint32_t len, int seed,
+                                  int *drafts, uint32_t max_k, uint32_t min_match,
+                                  bool near_valid, uint32_t near,
+                                  uint32_t *src, uint32_t *match) {
+    if (!hist || len < 2u || !max_k || min_match < 1u) return 0;
+    uint32_t best_len = 0, best_at = 0;
+    /* A copy that was being followed and broke off (an edited identifier, an
+     * escaped character) usually resumes right there: near the cursor two
+     * matching tokens are enough, and the closest candidate wins. */
+    if (near_valid && near < len) {
+        const uint32_t lo = near > 12u ? near - 12u : 0u;
+        const uint32_t hi = near + 32u < len - 1u ? near + 32u : len - 1u;
+        uint32_t best_dist = UINT32_MAX;
+        for (uint32_t j = lo; j < hi; j++) {
+            if (hist[j] != seed || j < 1u || hist[j - 1u] != hist[len - 1u]) continue;
+            const uint32_t dist = j + 1u > near ? j + 1u - near : near - (j + 1u);
+            if (dist < best_dist) { best_dist = dist; best_at = j; best_len = 2u; }
+        }
+        if (best_len) {
+            uint32_t m = 2u;
+            while (m < 64u && best_at >= m && len > m && hist[best_at - m] == hist[len - m]) m++;
+            best_len = m;
+        }
+    }
+    if (!best_len && len >= min_match + 1u) {
+        /* Anywhere: the most recent earlier occurrence of the seed with the
+         * longest matching tail (history + seed). */
+        for (uint32_t j = len - 1u; j-- > 0;) {
+            if (hist[j] != seed) continue;
+            uint32_t m = 1;
+            while (m < 64u && j >= m && hist[j - m] == hist[len - m]) m++;
+            if (m > best_len) {
+                best_len = m; best_at = j;
+                if (m >= 64u) break;
+            }
+        }
+        if (best_len < min_match) return 0;
+    }
+    if (!best_len) return 0;
+    uint32_t k = 0;
+    while (k < max_k && best_at + 1u + k < len) { drafts[k] = hist[best_at + 1u + k]; k++; }
+    if (src) *src = best_at + 1u;
+    if (match) *match = best_len;
+    return k;
+}
+
 /* Draft from the last committed target features, verify the seed and draft
  * suffix together, then retain only the target-accepted prefix. */
 static int ds41_session_spec(ds4_session *s, int first_token,
@@ -88536,7 +89299,11 @@ static int ds41_session_spec(ds4_session *s, int first_token,
                              char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     ds41_gpu_graph *g = &s->ds41_graph;
-    ds41_draft *d = g->draft;
+    ds41_snap_capture(s, false);
+    /* Without a drafter the proposals come from prompt lookup only, and the
+     * verification state is installed as g->draft just around the verify. */
+    const bool lookup_only = !g->draft;
+    ds41_draft *d = lookup_only ? g->lookup : g->draft;
     const uint32_t B = d->block, vocab = DS4_N_VOCAB;
     const uint32_t pos = (uint32_t)s->checkpoint.len;
     const bool exact = rng && temperature > 0.0f;
@@ -88549,7 +89316,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
     double propose_seconds = 0.0;
     const bool cost_scheduled = !e->dspark_confidence_threshold_set &&
         ds4_session_dspark_rocm_gfx1151_fast_path(s);
-    const bool draftable = pos >= 1u && d->mh_rows &&
+    const bool draftable = !lookup_only && pos >= 1u && d->mh_rows &&
         pos - 1u >= d->mh_pos0 && pos - 1u < d->mh_pos0 + d->mh_rows &&
         pos + B < g->ctx && max_tokens > 1 && accepted_cap > 1;
     /* The cost scheduler already returns width zero when drafting loses
@@ -88557,10 +89324,58 @@ static int ds41_session_spec(ds4_session *s, int first_token,
      * the next 64 independent decisions; that coarse backoff is retained only
      * for the explicit fixed-threshold policy. */
     /* Honor measured-region backoff before entering the proposal graph. */
-    const bool proposed = ds41_draft_should_propose(
+    /* Prompt lookup. With a drafter loaded it is opt-in (DS4_V41_LOOKUP_MIN=N
+     * replaces the drafter's proposals); without one it is the only proposer.
+     * N is the minimum number of matching tokens (default 4);
+     * DS4_V41_LOOKUP_K caps the draft width. */
+    static int lookup_env = -1, lookup_k = 0;
+    if (lookup_env < 0) {
+        const char *v = getenv("DS4_V41_LOOKUP_MIN");
+        lookup_env = v && v[0] ? atoi(v) : 0;
+        const char *kv = getenv("DS4_V41_LOOKUP_K");
+        lookup_k = kv && kv[0] ? atoi(kv) : (int)DS4_DSPARK_MAX_BLOCK_SIZE;
+        if (lookup_k < 1) lookup_k = 1;
+    }
+    const int lookup_min = !ds41_lookup_enabled() ? 0 : lookup_env > 0 ? lookup_env : 4;
+    uint32_t lookup_n = 0, lookup_src = 0, lookup_match = 0, lookup_bucket = 0;
+    struct ds41_lk_index *lookup_ix = NULL;
+    uint8_t lookup_level[DS4_DSPARK_MAX_BLOCK_SIZE], lookup_bin[DS4_DSPARK_MAX_BLOCK_SIZE];
+    float lookup_expect[DS4_DSPARK_MAX_BLOCK_SIZE];
+    if (lookup_min > 0 && s->lookup_allowed && (!lookup_only || !d->skip_left) &&
+        !tp_verify && (!g->image_count || ds41_lookup_with_images()) &&
+        pos + B < g->ctx && max_tokens > 1 && accepted_cap > 1)
+    {
+        uint32_t width = B;
+        if ((uint32_t)lookup_k < width) width = (uint32_t)lookup_k;
+        ds41_lookup_policy_init(d);
+        static int freq = -1;
+        if (freq < 0) {
+            const char *v = getenv("DS4_V41_LOOKUP_PROPOSER");
+            freq = !(v && !strcmp(v, "match"));
+        }
+        lookup_ix = freq ? ds41_lk_sync(d, s->checkpoint.v, pos, g->ctx) : NULL;
+        if (lookup_ix) {
+            lookup_n = ds41_lk_chain(lookup_ix, s->checkpoint.v, pos, first_token, drafts,
+                                     lookup_level, lookup_bin, lookup_expect, width);
+            lookup_n = ds41_lk_pick(d, lookup_ix, lookup_expect, lookup_n);
+        } else {
+            lookup_n = ds41_lookup_draft(s->checkpoint.v, pos, first_token, drafts,
+                width, (uint32_t)lookup_min,
+                d->lk_valid, d->lk_cursor, &lookup_src, &lookup_match);
+            if (lookup_n) {
+                lookup_bucket = ds41_lookup_bucket(d, lookup_match);
+                lookup_n = ds41_lookup_width(d, lookup_bucket, lookup_n, width);
+            }
+        }
+    }
+    if (!lookup_n) d->lk_run = 0;
+    if (lookup_only && d->skip_left) d->skip_left--;
+    if (!lookup_n) d->lk_streak = 0;
+    if (!lookup_n && d->lk_valid && ++d->lk_idle > 24u) d->lk_valid = false;
+    const bool proposed = lookup_n ? false : ds41_draft_should_propose(
         draftable, cost_scheduled, tp_verify, d->skip_left,
         ds41_draft_adapt_off());
-    if (draftable && !proposed) {
+    if (draftable && !proposed && !lookup_n) {
         d->skip_left--;
         if (stats) s->dspark_stats.scheduler_skips++;
     }
@@ -88587,6 +89402,33 @@ static int ds41_session_spec(ds4_session *s, int first_token,
             if (!ignore_eos && drafts[i] == eos_token) { k = i; break; }
             if (ignore_eos && ds4_token_is_stop_for_think_mode(
                     e, drafts[i], think_mode)) { k = i; break; }
+            if (ds41_lookup_control_token(e, drafts[i], false)) { k = i; break; }
+        }
+    }
+    if (lookup_n) {
+        k = lookup_n;
+        if (k > (uint32_t)max_tokens - 1u) k = (uint32_t)max_tokens - 1u;
+        if (k > (uint32_t)accepted_cap - 1u) k = (uint32_t)accepted_cap - 1u;
+        if (k > g->ctx - pos - 1u - exact) k = g->ctx - pos - 1u - exact;
+        for (uint32_t i = 0; i < k; i++) {
+            confidence[i] = 0.0f;
+            if (drafts[i] < 0 || drafts[i] >= (int)vocab) { k = i; break; }
+            if (!ignore_eos && drafts[i] == eos_token) { k = i; break; }
+            if (ignore_eos && ds4_token_is_stop_for_think_mode(
+                    e, drafts[i], think_mode)) { k = i; break; }
+            /* Never draft a control token or past one: the caller's parser
+             * state (tool calls, thinking, sampling mode) changes there and a
+             * V4.1 session cannot rewind cheaply. */
+            if (ds41_lookup_control_token(e, drafts[i], s->lookup_syntax)) { k = i; break; }
+            /* Tool-call syntax (forced greedy by the caller): a draft may run
+             * through the markup of one tag, DSML token included, but ends
+             * with the token that closes the tag. What follows a tag is either
+             * a sampled payload, which must not be verified greedily, or the
+             * end of the tool call, past which the caller cannot rewind. */
+            if (s->lookup_syntax) {
+                const ds4_str *ts = &e->vocab.token[drafts[i]];
+                if (ts->ptr && memchr(ts->ptr, '>', (size_t)ts->len)) { k = i + 1u; break; }
+            }
         }
     }
     if (stats) {
@@ -88606,7 +89448,12 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         fprintf(stderr, "\n");
     }
     if (k == 0) {
+        const double t_plain = now_sec();
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        if (d->lk_plain_ms > 0.0f) {
+            const float ms = (float)((now_sec() - t_plain) * 1000.0);
+            if (ms > 20.0f && ms < 400.0f) d->lk_plain_ms = 0.95f * d->lk_plain_ms + 0.05f * ms;
+        }
         accepted[0] = first_token;
         ds41_draft_adapt(d, proposed, 0, 0, tp_verify);
         if (stats) {
@@ -88630,6 +89477,8 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         return -1;
     }
     const double tv = stats ? now_sec() : 0.0;
+    const double t_cycle = now_sec();
+    if (lookup_only) g->draft = d;
     bool ok = ds41_draft_verify(g, &e->model, &e->weights,
                                 tokens, n, rows);
     if (tp_verify && e->tp.vocab_split) {
@@ -88652,6 +89501,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
             (void)ds4_tp_send_verify_commit(e->tp.ctx,
                 DS4_TP_VERIFY_ROLLBACK_REPLAY, 0);
         free(rows);
+        if (lookup_only) g->draft = NULL;
         s->checkpoint_valid = false;
         payload_set_err(err, errlen, "DeepSeek V4.1 verify failed");
         return -1;
@@ -88683,6 +89533,49 @@ static int ds41_session_spec(ds4_session *s, int first_token,
     }
     s->mtp_draft_valid = false;
     ok = ds41_draft_rollback(g, tokens, n, matched + 1u, history);
+    if (lookup_n) {
+        /* Follow the copy: it continues after the accepted tokens, or after
+         * the one token the model changed. */
+        d->lk_cursor = lookup_src + matched + (matched < k ? 1u : 0u);
+        d->lk_valid = true;
+        d->lk_idle = 0;
+        d->lk_streak = matched == k && k >= DS41_LOOKUP_BASE_BLOCK ? d->lk_streak + 1u : 0u;
+        d->lk_run = matched == k ? d->lk_run + 1u : 0u;
+        /* Policy statistics: what this kind of draft accepts, what a row costs. */
+        if (lookup_ix) {
+            /* Steps up to the first rejection were tested; later ones were not. */
+            for (uint32_t i = 0; i < k && i <= matched; i++) {
+                float *acc = &lookup_ix->cal_acc[lookup_level[i]][lookup_bin[i]];
+                float *tried = &lookup_ix->cal_try[lookup_level[i]][lookup_bin[i]];
+                *acc = 0.995f * *acc + (i < matched ? 1.0f : 0.0f);
+                *tried = 0.995f * *tried + 1.0f;
+            }
+            lookup_ix->skipped = 0;
+        } else {
+            d->lk_acc[lookup_bucket] = 0.97f * d->lk_acc[lookup_bucket] + (float)matched;
+            d->lk_drafted[lookup_bucket] = 0.97f * d->lk_drafted[lookup_bucket] + (float)k;
+            d->lk_skipped[lookup_bucket] = 0;
+        }
+        const float cycle_ms = (float)((now_sec() - t_cycle) * 1000.0);
+        float row_ms = (cycle_ms - 0.85f * d->lk_plain_ms) / (float)n;
+        if (row_ms < 5.0f) row_ms = 5.0f;
+        if (row_ms < 200.0f) d->lk_row_ms = 0.9f * d->lk_row_ms + 0.1f * row_ms;
+        d->lk_stat_cycles++;
+        d->lk_stat_drafted += k;
+        d->lk_stat_accepted += matched;
+        if ((d->lk_stat_cycles & 127u) == 0u)
+            fprintf(stderr, "ds4: V4.1 lookup cycles=%llu drafted=%llu accepted=%llu (%.0f%%) "
+                    "skipped=%llu step=%.1f ms row=%.1f ms\n",
+                    (unsigned long long)d->lk_stat_cycles,
+                    (unsigned long long)d->lk_stat_drafted,
+                    (unsigned long long)d->lk_stat_accepted,
+                    100.0 * (double)d->lk_stat_accepted / (double)d->lk_stat_drafted,
+                    (unsigned long long)d->lk_stat_skipped,
+                    (double)d->lk_plain_ms, (double)d->lk_row_ms);
+    }
+    if (lookup_only) {
+        g->draft = NULL;
+    }
     if (tp_verify) {
         const int32_t mode = ok && matched + 1u == n ?
             DS4_TP_VERIFY_COMMIT_FULL :
@@ -88757,7 +89650,7 @@ static int ds4_session_eval_speculative_argmax_impl(
         return 1;
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s) && s->ds41_graph.draft) {
+    if (ds4_session_is_ds41(s) && (s->ds41_graph.draft || s->ds41_graph.lookup)) {
         if (!accepted || accepted_cap <= 0) return 0;
         return ds41_session_spec(s, first_token, max_tokens, eos_token,
             ignore_eos, think_mode, 0.0f, 0, 0.0f, 0.0f, NULL,
@@ -89633,7 +90526,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
             accepted, accepted_cap, err, errlen);
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s) && s->ds41_graph.draft) {
+    if (ds4_session_is_ds41(s) && (s->ds41_graph.draft || s->ds41_graph.lookup)) {
         return ds41_session_spec(s, first_token, max_tokens, eos_token,
             false, DS4_THINK_HIGH, temperature, top_k, top_p, min_p, rng,
             accepted, accepted_cap, err, errlen);
@@ -89766,6 +90659,7 @@ void ds4_session_invalidate(ds4_session *s) {
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (s->ds41_graph_ready) ds41_graph_reset(&s->ds41_graph);
+    ds41_snaps_clear(s);
 #endif
     ds4_session_glm_reset_dense_cache(s);
 #endif
@@ -89817,6 +90711,10 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (s->checkpoint_valid && ds4_session_is_ds41(s) && !s->distributed)
+        state_ok = ds41_snap_restore(s, pos);
+#endif
 #endif
     s->checkpoint.len = pos;
     /* DeepSeek compressors cannot be rolled back by truncating their row
@@ -89833,6 +90731,15 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 
 int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
+}
+
+int ds4_session_rewind_point(ds4_session *s, int max_pos) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (s && !s->distributed && ds4_session_is_ds41(s)) return ds41_snap_best(s, max_pos);
+#else
+    (void)s; (void)max_pos;
+#endif
+    return -1;
 }
 
 bool ds4_session_checkpoint_valid(const ds4_session *s) {

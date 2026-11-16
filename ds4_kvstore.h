@@ -16,6 +16,7 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+#define DS4_KVSTORE_EXT_VISION_KEY        (1u << 4)
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -86,6 +87,8 @@ typedef struct {
     uint8_t quant_bits;
     uint32_t ctx_size;
     bool reject_different_quant;
+    uint8_t reason;   /* DS4_KVSTORE_REASON_* of the incoming checkpoint; 0 = not given */
+    int tokens;       /* its token count; 0 = not given */
 } ds4_kvstore_eviction_context;
 
 typedef struct {
@@ -119,6 +122,15 @@ void ds4_kvstore_close(ds4_kvstore *kc);
 void ds4_kvstore_clear(ds4_kvstore *kc);
 void ds4_kvstore_entry_free(ds4_kvstore_entry *e);
 
+/* Disk key for a token prefix that contains images: the ordinary token
+ * rendering with each image's placeholder run replaced by
+ * "\036IMG<64 hex fingerprint>:<count>\037". Byte-equal keys mean equal
+ * tokens and equal images, so image sessions can use text-prefix lookup.
+ * starts/counts/fps describe images in token order; images at or after len
+ * are ignored. Returns NULL if an image straddles len. */
+char *ds4_kvstore_render_vision_key(ds4_engine *engine, const ds4_tokens *tokens, int len,
+                                    const uint32_t *starts, const uint32_t *counts,
+                                    const uint8_t (*fps)[32], size_t n, size_t *out_len);
 char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      const ds4_tokens *tokens,
                                      size_t *out_len);
