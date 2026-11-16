@@ -41609,7 +41609,6 @@ static bool ds41_stream_selected_begin(ds41_gpu_graph *g, const ds4_model *m,
 }
 #endif
 
-static bool ds41_five_experts(ds4_gpu_tensor *weights, uint32_t rows);
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -41637,8 +41636,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
                 m->map, m->size, bias->abs_offset, 0, 0, token,
                 DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
-                g->route_logits) &&
-            ds41_five_experts(g->route_weights, 1u);
+                g->route_logits);
 #ifdef DS4_ROCM_BUILD
         if (penalized) ds4_gpu_dsv41_route_penalty_end();
 #endif
@@ -41790,30 +41788,6 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
         start = now_sec();
         ok = ds41_moe_finish(g, il);
         if (profile) ok = ds41_decode_stage_profile_mark("moe_finish", il, start, ok);
-    }
-    /* Diagnostic: DS4_V41_ROUTE_PREDICT_DUMP=1 also routes the NEXT layer on
-     * this layer's FFN input (one layer stale) and prints its six picks, to
-     * measure how well a one-layer-ahead prefetch would predict. */
-    static int predict_dump = -1;
-    if (predict_dump < 0) predict_dump = getenv("DS4_V41_ROUTE_PREDICT_DUMP") != NULL;
-    if (ok && predict_dump && il + 1u < DS4_N_LAYER) {
-        static ds4_gpu_tensor *pl, *pp, *ps, *pw;
-        if (!pl) {
-            pl = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
-            pp = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
-            ps = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int32_t));
-            pw = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
-        }
-        const ds4_layer_weights *nl = l + 1;
-        const ds4_tensor *nb = ds41_image_at(g, g->pos) ? nl->ffn_exp_probs_vl : nl->ffn_exp_probs_b;
-        int32_t ids[6];
-        ok = pl && pp && ps && pw && nb &&
-            ds41_matmul(pl, m, nl->ffn_gate_inp, g->norm, false) &&
-            ds4_gpu_router_select_tensor(ps, pw, pp, m->map, m->size, nb->abs_offset, 0, 0, token,
-                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false, pl) &&
-            ds4_gpu_synchronize() && ds4_gpu_tensor_read(ps, 0, ids, sizeof(ids));
-        if (ok) fprintf(stderr, "ds4: PD %u %u %d %d %d %d %d %d\n", g->pos, il + 1u,
-                        ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
     }
     /* Diagnostic: DS4_V41_ROUTE_DUMP=1 prints the 16 best router scores of
      * each decoded layer (drains the GPU; for offline prefetch studies). */
@@ -42551,28 +42525,12 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
 }
 #endif
 
-/* DS4_V41_EXPERTS=5 (experiment, changes output): see ds4_gpu_dsv41_drop_last_route. */
-static bool ds41_five_experts(ds4_gpu_tensor *weights, uint32_t rows) {
-#ifdef DS4_ROCM_BUILD
-    static int five = -1;
-    if (five < 0) {
-        const char *v = getenv("DS4_V41_EXPERTS");
-        five = v && v[0] == '5';
-        if (five) fprintf(stderr, "ds4: V4.1 EXPERIMENT: five routed experts instead of six\n");
-    }
-    return !five || ds4_gpu_dsv41_drop_last_route(weights, rows) != 0;
-#else
-    (void)weights; (void)rows;
-    return true;
-#endif
-}
 static uint32_t g_ds41_route_layer;   /* layer of the batch being routed (miss-penalty experiment) */
 static bool ds41_route_batch_six(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t count);
 static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_layer_weights *l, uint32_t count) {
-    return ds41_route_batch_six(g, m, l, count) &&
-        ds41_five_experts(g->batch.route_weights, count);
+    return ds41_route_batch_six(g, m, l, count);
 }
 static bool ds41_route_batch_six(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t count) {
@@ -74670,57 +74628,8 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
 }
 #endif
 
-/* Experiment only (inert unless DS4_V41_DENSE_REQUANT_BITS=2..7 is set): round
- * every device-cached Q8_0 matrix to a coarser per-block grid, still stored
- * and run as Q8_0. It measures what a smaller dense format would cost in
- * quality before any such format exists. DS4_V41_DENSE_REQUANT_MATCH=a,b
- * limits it to tensors whose name contains one of the substrings. */
-static void ds41_dense_requant_experiment(ds4_engine *e) {
-#ifdef DS4_ROCM_BUILD
-    const char *bv = getenv("DS4_V41_DENSE_REQUANT_BITS");
-    if (!e || !bv || !bv[0]) return;
-    const int bits = !strcmp(bv, "f6") ? -6 : atoi(bv);   /* f6: 6-bit block float */
-    if (!((bits >= 2 && bits <= 7) || bits == -6)) return;
-    const char *match = getenv("DS4_V41_DENSE_REQUANT_MATCH");
-    const ds4_model *m = &e->model;
-    uint64_t done = 0, done_bytes = 0, skipped = 0, failed = 0;
-    for (uint64_t i = 0; i < m->n_tensors; i++) {
-        const ds4_tensor *t = &m->tensors[i];
-        if (t->bytes == 0 || t->type != DS4_TENSOR_Q8_0 || t->ndim != 2) continue;
-        char name[160];
-        snprintf(name, sizeof(name), "%.*s", (int)t->name.len, t->name.ptr);
-        bool want = !(match && match[0]);
-        for (const char *q = match; !want && q && *q; ) {
-            const char *c = strchr(q, ',');
-            const size_t n = c ? (size_t)(c - q) : strlen(q);
-            char part[96];
-            if (n > 0 && n < sizeof(part)) {
-                memcpy(part, q, n); part[n] = 0;
-                if (strstr(name, part)) want = true;
-            }
-            q = c ? c + 1 : NULL;
-        }
-        if (!want) { skipped++; continue; }
-        if (ds4_gpu_debug_requant_q8_range(m->map, t->abs_offset, t->bytes, bits)) {
-            done++; done_bytes += t->bytes;
-        } else {
-            failed++;
-            if (failed <= 8) fprintf(stderr, "ds4: dense requant: %s not rewritten\n", name);
-        }
-    }
-    (void)ds4_gpu_debug_requant_q8_range(m->map, 0, 0, bits);
-    fprintf(stderr, "ds4: EXPERIMENT dense Q8 weights rounded to %d bits: %llu tensors, %.2f GiB "
-            "(%llu not matched, %llu not rewritten)\n", bits, (unsigned long long)done,
-            (double)done_bytes / 1073741824.0, (unsigned long long)skipped, (unsigned long long)failed);
-#else
-    (void)e;
-#endif
-}
-
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
-    const int rc = ds4_engine_open_internal(out, opt, NULL);
-    if (rc == 0 && out) ds41_dense_requant_experiment(*out);
-    return rc;
+    return ds4_engine_open_internal(out, opt, NULL);
 }
 
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
@@ -89457,41 +89366,6 @@ static int ds41_session_spec(ds4_session *s, int first_token,
                 lookup_bucket = ds41_lookup_bucket(d, lookup_match);
                 lookup_n = ds41_lookup_width(d, lookup_bucket, lookup_n, width);
             }
-        }
-    }
-    /* Diagnostic: DS4_V41_RECYCLE_STATS=1 measures what "token recycling"
-     * would accept without verifying anything: for every token it remembers
-     * the model's own top choice the last time that token was the latest one,
-     * and counts how often that remembered choice is the token chosen now,
-     * overall and where the lookup proposer has no draft. */
-    {
-        static int recycle = -1;
-        static int32_t *next_after;
-        static uint64_t tried, hit, tried_nl, hit_nl, steps;
-        if (recycle < 0) {
-            recycle = getenv("DS4_V41_RECYCLE_STATS") != NULL;
-            if (recycle) {
-                next_after = malloc((size_t)vocab * sizeof(*next_after));
-                if (!next_after) recycle = 0;
-                else memset(next_after, 0xff, (size_t)vocab * sizeof(*next_after));
-            }
-        }
-        if (recycle && pos >= 1u) {
-            const int prev = s->checkpoint.v[pos - 1u];
-            if (prev >= 0 && (uint32_t)prev < vocab) {
-                if (next_after[prev] >= 0) {
-                    tried++; hit += next_after[prev] == first_token;
-                    if (!lookup_n) { tried_nl++; hit_nl += next_after[prev] == first_token; }
-                }
-                next_after[prev] = sample_argmax(s->logits, vocab);
-            }
-            if ((++steps & 511u) == 0u)
-                fprintf(stderr, "ds4: V4.1 recycle stats steps=%llu remembered=%llu hit=%.1f%% | "
-                        "without a lookup draft: %llu hit=%.1f%%\n",
-                        (unsigned long long)steps, (unsigned long long)tried,
-                        tried ? 100.0 * (double)hit / (double)tried : 0.0,
-                        (unsigned long long)tried_nl,
-                        tried_nl ? 100.0 * (double)hit_nl / (double)tried_nl : 0.0);
         }
     }
     if (!lookup_n) d->lk_run = 0;

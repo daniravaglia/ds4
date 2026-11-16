@@ -348,24 +348,6 @@ extern "C" int ds4_gpu_dsv41_hc_mix_side(ds4_gpu_tensor *split_out, ds4_gpu_tens
     return 1;
 }
 
-/* Experiment (DS4_V41_EXPERTS=5): drop the lowest-ranked of the six routed
- * experts and renormalise the other five, as if the model routed to five.
- * This changes the model's output; it exists to measure the quality cost. */
-__global__ static void v41_drop_last_route_kernel(float *weights, uint32_t rows) {
-    const uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
-    float *w = weights + (uint64_t)r * 6u;
-    const float five = w[0] + w[1] + w[2] + w[3] + w[4], six = five + w[5];
-    const float k = five > 0.0f ? six / five : 1.0f;
-    for (uint32_t i = 0; i < 5u; i++) w[i] *= k;
-    w[5] = 0.0f;
-}
-extern "C" int ds4_gpu_dsv41_drop_last_route(ds4_gpu_tensor *weights, uint32_t rows) {
-    if (!weights || !rows || !cuda_tensor_has_elems2(weights, 6u, rows, 4u)) return 0;
-    v41_drop_last_route_kernel<<<(rows + 63u) / 64u, 64u>>>((float *)weights->ptr, rows);
-    return cuda_ok(cudaGetLastError(), "V4.1 five-expert experiment");
-}
-
 struct v41_rope_args {
     uint32_t width, heads, start, stride, inverse;
     float frequencies[32];
